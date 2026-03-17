@@ -49,6 +49,16 @@ html, body, #root {
 /* ── Connection line SVG ──────────────────────────────────────────────── */
 .cluster-svg { position: absolute; inset: 0; pointer-events: none; }
 
+/* ── Raft replication flow animation ─────────────────────────────────── */
+@keyframes raftFlow {
+  from { stroke-dashoffset: 0; }
+  to   { stroke-dashoffset: -16; }
+}
+@keyframes raftFlowFast {
+  from { stroke-dashoffset: 0; }
+  to   { stroke-dashoffset: -16; }
+}
+
 /* ── Disk write shimmer ───────────────────────────────────────────────── */
 @keyframes disk-write {
   0%   { background-position: -200% 0; }
