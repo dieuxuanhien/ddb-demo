@@ -1,0 +1,62 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Base ─────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  background: #1e1f22;
+  color: #dbdee1;
+}
+
+/* ── Custom scrollbar ─────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #3f4147; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #5c5f66; }
+
+/* ── Data packet animation ────────────────────────────────────────────── */
+.packet {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 50;
+  transition:
+    left   1.2s cubic-bezier(0.25, 0.46, 0.45, 0.94),
+    top    1.2s cubic-bezier(0.25, 0.46, 0.45, 0.94),
+    opacity 0.3s ease;
+}
+
+/* ── Node ring ────────────────────────────────────────────────────────── */
+.node-ring {
+  border: 2px solid #5865f2;
+  transition: border-color 0.4s, box-shadow 0.4s;
+}
+.node-ring.active   { border-color: #23a55a; }
+.node-ring.evalring { border-color: #faa61a !important; }
+
+/* ── Shard badge ──────────────────────────────────────────────────────── */
+.shard-badge {
+  animation: fadeIn 0.4s ease-out;
+}
+
+/* ── Connection line SVG ──────────────────────────────────────────────── */
+.cluster-svg { position: absolute; inset: 0; pointer-events: none; }
+
+/* ── Disk write shimmer ───────────────────────────────────────────────── */
+@keyframes disk-write {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.disk-writing {
+  background: linear-gradient(90deg,
+    #23a55a22 25%, #23a55a88 50%, #23a55a22 75%);
+  background-size: 200% 100%;
+  animation: disk-write 0.8s linear;
+}
