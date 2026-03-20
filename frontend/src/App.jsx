@@ -171,7 +171,17 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({ name: name.trim() }),
       });
-      if (!res.ok) { const e = await res.json(); throw new Error(e.error || res.statusText); }
+      if (!res.ok) {
+        const bodyText = await res.text();
+        let errorMsg = `${res.status} ${res.statusText}`;
+        try {
+          const parsed = JSON.parse(bodyText);
+          errorMsg = parsed.error || parsed.message || errorMsg;
+        } catch {
+          if (bodyText.trim()) errorMsg = bodyText.slice(0, 140);
+        }
+        throw new Error(errorMsg);
+      }
       const newServer = await res.json();
       await fetchServers();
       handleSelectServer(newServer);

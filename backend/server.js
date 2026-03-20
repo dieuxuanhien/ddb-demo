@@ -23,6 +23,12 @@ const DB_URLS = [
   "postgresql://root@roach3:26257/discord_clone?sslmode=disable",
 ];
 const pools = DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 3000 }));
+const ADMIN_DB_URLS = DB_URLS.map((u) => {
+  const parsed = new URL(u);
+  parsed.pathname = "/defaultdb";
+  return parsed.toString();
+});
+const adminPools = ADMIN_DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 3000 }));
 
 async function queryDB(text, params) {
   const errs = [];
@@ -33,10 +39,19 @@ async function queryDB(text, params) {
   throw new Error(`All nodes unavailable: ${errs.join(" | ")}`);
 }
 
+async function queryAdmin(text, params) {
+  const errs = [];
+  for (const pool of adminPools) {
+    try { return await pool.query(text, params); }
+    catch (e) { errs.push(e.message); }
+  }
+  throw new Error(`All admin connections unavailable: ${errs.join(" | ")}`);
+}
+
 async function waitForDB(maxAttempts = 30, delayMs = 3000) {
   for (let i = 1; i <= maxAttempts; i++) {
     try {
-      await queryDB("SELECT 1");
+      await queryAdmin("SELECT 1");
       console.log("✓ Connected to CockroachDB");
       return;
     } catch (err) {
@@ -45,6 +60,41 @@ async function waitForDB(maxAttempts = 30, delayMs = 3000) {
     }
   }
   throw new Error("Could not connect to the database after multiple attempts.");
+}
+
+async function ensureSchema() {
+  // Allow booting without db/init.sh by creating the DB schema in-app.
+  await queryAdmin("CREATE DATABASE IF NOT EXISTS discord_clone");
+
+  await queryDB(`
+    CREATE TABLE IF NOT EXISTS servers (
+      id INT DEFAULT unique_rowid() PRIMARY KEY,
+      name TEXT NOT NULL,
+      node_id INT NOT NULL DEFAULT 1
+    )
+  `);
+
+  await queryDB("CREATE UNIQUE INDEX IF NOT EXISTS servers_name_idx ON servers (name)");
+
+  await queryDB(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id INT DEFAULT unique_rowid() PRIMARY KEY,
+      server_id INT NOT NULL REFERENCES servers (id) ON DELETE CASCADE,
+      username TEXT NOT NULL DEFAULT 'User',
+      content TEXT NOT NULL,
+      timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await queryDB("CREATE INDEX IF NOT EXISTS messages_server_id_idx ON messages (server_id, timestamp DESC)");
+
+  await queryDB(`
+    INSERT INTO servers (name, node_id)
+    VALUES ('General', 1), ('Random', 2)
+    ON CONFLICT (name) DO NOTHING
+  `);
+
+  console.log("✓ Database schema verified");
 }
 
 // ── Docker Engine API helper ────────────────────────────────────────────────
@@ -80,6 +130,52 @@ async function findContainer(service) {
   const f = encodeURIComponent(JSON.stringify({ label: [`com.docker.compose.service=${service}`] }));
   const { body } = await dockerRequest("GET", `/containers/json?all=1&filters=${f}`);
   return Array.isArray(body) && body.length > 0 ? body[0] : null;
+}
+
+async function initCluster(maxAttempts = 30, delayMs = 2000) {
+  for (let i = 1; i <= maxAttempts; i++) {
+    try {
+      const c = await findContainer("roach1");
+      if (!c) throw new Error("roach1 container not found yet");
+
+      const createExec = await dockerRequest("POST", `/containers/${c.Id}/exec`, {
+        AttachStdout: true,
+        AttachStderr: true,
+        Cmd: ["cockroach", "init", "--insecure", "--host=roach1:26257"],
+      });
+
+      if (!createExec.body || !createExec.body.Id) {
+        throw new Error("failed to create exec for cockroach init");
+      }
+
+      const started = await dockerRequest("POST", `/exec/${createExec.body.Id}/start`, {
+        Detach: false,
+        Tty: false,
+      });
+
+      const output = String(started.body || "");
+      if (
+        output.includes("Cluster successfully initialized") ||
+        output.toLowerCase().includes("already been initialized")
+      ) {
+        console.log("✓ CockroachDB cluster initialized");
+        return;
+      }
+
+      if (started.status >= 200 && started.status < 300 && !output.trim()) {
+        // Some Docker daemons return empty stdout on success.
+        console.log("✓ CockroachDB cluster init attempted");
+        return;
+      }
+
+      throw new Error(output || `cockroach init failed with status ${started.status}`);
+    } catch (err) {
+      console.log(`  Cluster init pending (attempt ${i}/${maxAttempts}): ${err.message}`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+
+  throw new Error("Could not initialize CockroachDB cluster.");
 }
 
 // ── Express app ────────────────────────────────────────────────────────────
@@ -214,6 +310,8 @@ app.post("/api/nodes/:id/start", async (req, res) => {
 
 // ── Boot ────────────────────────────────────────────────────────────────────
 
-waitForDB()
+initCluster()
+  .then(() => waitForDB())
+  .then(() => ensureSchema())
   .then(() => app.listen(PORT, () => console.log(`✓ API server listening on http://0.0.0.0:${PORT}`)))
   .catch((err) => { console.error("Fatal:", err.message); process.exit(1); });

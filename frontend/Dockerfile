@@ -1,5 +1,5 @@
 # ── Stage 1: build ───────────────────────────────────────────────────────────
-FROM node:20-alpine AS builder
+FROM docker.io/library/node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ COPY . .
 RUN npm run build
 
 # ── Stage 2: serve with nginx ─────────────────────────────────────────────────
-FROM nginx:1.25-alpine
+FROM docker.io/library/nginx:1.25-alpine
 
 COPY --from=builder /app/dist /usr/share/nginx/html
 

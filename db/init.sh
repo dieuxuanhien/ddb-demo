@@ -8,6 +8,10 @@
 #   3. Wait for SQL to become available (signals cluster is fully up).
 #   4. Load schema.sql.
 # ---------------------------------------------------------------------------
+# Enable strict mode for bash scripts
+# -e: Exit immediately if any command exits with a non-zero status
+# -u: Treat unset variables as an error and exit
+# -o pipefail: Return the exit status of the last command in a pipeline that failed, or 0 if all succeeded
 set -euo pipefail
 
 # ── 1. Wait for TCP port 26257 on each node ──────────────────────────────

@@ -68,9 +68,10 @@ shard for the purposes of this visualisation:
 cd discord-demo
 
 # 2. Start everything (cluster + backend + frontend)
-bash ./db/init.sh ( only first time)
-
 docker compose up --build
+
+# Optional: run this only if you want to manually pre-seed/reset schema
+# bash ./db/init.sh
 
 # First boot takes ~90 s while CockroachDB initialises.
 # Watch for: "✓ API server listening on http://0.0.0.0:3001"
