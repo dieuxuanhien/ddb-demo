@@ -1,9 +1,9 @@
 
-services:
-  backend:
-    build: !reset null
-    image: dieuxuanhien/discord-demo-backend:latest
+# services:
+#   backend:
+#     build: !reset null
+#     image: dieuxuanhien/discord-demo-backend:latest
 
-  frontend:
-    build: !reset null
-    image: dieuxuanhien/discord-demo-frontend:latest
+#   frontend:
+#     build: !reset null
+#     image: dieuxuanhien/discord-demo-frontend:latest

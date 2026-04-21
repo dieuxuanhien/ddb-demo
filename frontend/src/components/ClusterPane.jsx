@@ -2,12 +2,13 @@ import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react
 
 // Percentage-based positions for PACKET animation (these match card placements below)
 const NODE_POS = {
-  1: { x: 22, y: 22 },
-  2: { x: 72, y: 22 },
-  3: { x: 47, y: 64 },
+  1: { x: 20, y: 20 },
+  2: { x: 80, y: 20 },
+  3: { x: 20, y: 70 },
+  4: { x: 80, y: 70 },
 };
-const CLIENT_POS = { x: 47, y: 92 };
-const EDGES = [[1, 2], [2, 3], [1, 3]];
+const CLIENT_POS = { x: 50, y: 92 };
+const EDGES = [[1, 2], [2, 4], [4, 3], [3, 1], [1, 4], [2, 3]];
 
 // ── Animated data-packet ──────────────────────────────────────────────────
 function DataPacket({ id, targetNode, fromNode = null, color, onDone }) {
@@ -41,7 +42,18 @@ const SHARD_COLORS = [
 ];
 
 // eslint-disable-next-line react/display-name
-const NodeCard = ({ nodeId, shards, evaluating, highlight, status, onKill, onRestart }) => {
+const NodeCard = ({
+  nodeId,
+  replicas,
+  rf,
+  evaluating,
+  highlight,
+  status,
+  deadCount,
+  liveNodes,
+  onKill,
+  onRestart,
+}) => {
   const isDead     = status === "dead";
   const isStarting = status === "starting";
 
@@ -50,6 +62,9 @@ const NodeCard = ({ nodeId, shards, evaluating, highlight, status, onKill, onRes
   if (highlight)   borderClass = "border-discord-green animate-nodeFlashGreen";
   if (isDead)      borderClass = "border-red-600/70";
   if (isStarting)  borderClass = "border-yellow-400/70 animate-pulse";
+
+  const hasQuorum = liveNodes >= 2;
+  const inMajority = !isDead && hasQuorum;
 
   return (
     <div
@@ -97,25 +112,45 @@ const NodeCard = ({ nodeId, shards, evaluating, highlight, status, onKill, onRes
             <path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5" />
             <path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3" />
           </svg>
-          <span>isolated storage</span>
+          <span>local disk + raft replica</span>
         </div>
       )}
 
-      {/* Shards */}
-      <div className="space-y-1 min-h-[20px]">
-        {shards.length === 0 && !isDead && (
-          <p className="text-[10px] text-slate-600 italic px-1">no shards</p>
+      {/* CockroachDB behavior hint */}
+      <div className="mb-2 px-1.5 py-1 rounded text-[9px] font-mono border border-white/5 bg-slate-900/40">
+        {isDead && (
+          <span className="text-red-400">replicas on this node unavailable</span>
         )}
-        {shards.map((s, i) => (
-          <div key={s.id}
+        {!isDead && deadCount === 0 && (
+          <span className="text-emerald-400">healthy replica set (RF={rf})</span>
+        )}
+        {!isDead && deadCount > 0 && inMajority && (
+          <span className="text-yellow-300">serving quorum traffic; some ranges under-replicated</span>
+        )}
+        {!isDead && deadCount > 0 && !inMajority && (
+          <span className="text-red-400">no majority available for writes</span>
+        )}
+      </div>
+
+      {/* Replica set labels */}
+      <div className="space-y-1 min-h-[20px]">
+        {replicas.length === 0 && !isDead && (
+          <p className="text-[10px] text-slate-600 italic px-1">no replicated ranges yet</p>
+        )}
+        {replicas.map((entry, i) => (
+          <div key={`${entry.id}-${nodeId}`}
             className={`shard-badge flex items-center gap-1.5 px-1.5 py-0.5 rounded
               border border-white/5
               ${isDead ? "bg-slate-900/40 opacity-50" : "bg-slate-800/80"}`}>
             <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0
-              ${isDead ? "bg-slate-600" : SHARD_COLORS[i % SHARD_COLORS.length]}`} />
-            <span className={`text-[10px] truncate
+              ${isDead ? "bg-slate-600" : entry.role === "leaseholder" ? "bg-emerald-400" : SHARD_COLORS[i % SHARD_COLORS.length]}`} />
+            <span className={`text-[10px] truncate flex-1
               ${isDead ? "text-slate-600 line-through" : "text-slate-300"}`}>
-              {s.name}
+              {entry.name}
+            </span>
+            <span className={`text-[8px] uppercase tracking-widest font-semibold
+              ${isDead ? "text-slate-600" : entry.role === "leaseholder" ? "text-emerald-300" : "text-slate-500"}`}>
+              {entry.role === "leaseholder" ? "L" : "R"}
             </span>
           </div>
         ))}
@@ -158,7 +193,7 @@ function ConnectionLines({ nodeRefs, containerRef, nodeStatuses, evaluating }) {
     if (!container) return;
     const cRect = container.getBoundingClientRect();
     const next  = {};
-    for (const id of [1, 2, 3]) {
+    for (const id of [1, 2, 3, 4]) {
       const el = nodeRefs.current[id];
       if (el) {
         const r = el.getBoundingClientRect();
@@ -167,7 +202,7 @@ function ConnectionLines({ nodeRefs, containerRef, nodeStatuses, evaluating }) {
     }
     // Only update state if a position actually changed — avoids infinite render loop
     setPts((prev) => {
-      for (const id of [1, 2, 3]) {
+      for (const id of [1, 2, 3, 4]) {
         if (!prev[id] || !next[id]) return next;
         if (Math.abs(prev[id].x - next[id].x) > 0.5 || Math.abs(prev[id].y - next[id].y) > 0.5) return next;
       }
@@ -255,19 +290,43 @@ function ConnectionLines({ nodeRefs, containerRef, nodeStatuses, evaluating }) {
 // ── Main component ─────────────────────────────────────────────────────────
 export default function ClusterPane({
   servers, packets, evaluating, nodeHighlight, activityLog,
-  nodeStatuses = { 1: "live", 2: "live", 3: "live" },
+  placementByServer = {},
+  nodeStatuses = { 1: "live", 2: "live", 3: "live", 4: "live" },
   onPacketDone, onKillNode, onRestartNode,
 }) {
   const containerRef = useRef(null);
-  const nodeRefs     = useRef({ 1: null, 2: null, 3: null });
+  const nodeRefs     = useRef({ 1: null, 2: null, 3: null, 4: null });
 
-  const nodeShards = { 1: [], 2: [], 3: [] };
+  const nodeReplicas = { 1: [], 2: [], 3: [], 4: [] };
+  const replicaCounts = [];
   servers.forEach((s) => {
-    nodeShards[s.node_id] = nodeShards[s.node_id] ?? [];
-    nodeShards[s.node_id].push(s);
+    const placement = placementByServer[String(s.id)] ?? placementByServer[s.id] ?? null;
+    const replicaNodesFromDB = Array.isArray(placement?.effectiveReplicas) && placement.effectiveReplicas.length > 0
+      ? placement.effectiveReplicas
+      : Array.isArray(placement?.votingReplicas) && placement.votingReplicas.length > 0
+        ? placement.votingReplicas
+        : Array.isArray(placement?.replicas) && placement.replicas.length > 0
+          ? placement.replicas
+          : null;
+    const replicaNodes = replicaNodesFromDB ?? [];
+    const leaseholderNode = Number.isInteger(placement?.leaseholderNode)
+      ? placement.leaseholderNode
+      : replicaNodes[0] ?? null;
+    replicaCounts.push(replicaNodes.length);
+
+    for (const nodeId of replicaNodes) {
+      nodeReplicas[nodeId] = nodeReplicas[nodeId] ?? [];
+      nodeReplicas[nodeId].push({
+        ...s,
+        role: nodeId === leaseholderNode ? "leaseholder" : "replica",
+        leaseholderNode,
+      });
+    }
   });
 
-  const deadCount = [1, 2, 3].filter((id) => nodeStatuses[id] === "dead").length;
+  const effectiveRf = replicaCounts.length ? Math.max(...replicaCounts) : 3;
+
+  const deadCount = [1, 2, 3, 4].filter((id) => nodeStatuses[id] === "dead").length;
 
   return (
     <div className="flex flex-col h-full">
@@ -277,7 +336,7 @@ export default function ClusterPane({
           <h2 className="text-sm font-bold text-white">
             CockroachDB Cluster
             <span className="ml-2 text-[10px] font-normal text-slate-500 uppercase tracking-widest">
-              Shared-Nothing · 3 Nodes
+              Shared-Nothing · 4 Nodes (Real Placement)
             </span>
           </h2>
           {deadCount > 0 && (
@@ -288,20 +347,25 @@ export default function ClusterPane({
         </div>
         {evaluating && (
           <p className="text-[11px] text-yellow-400 mt-0.5 animate-pulse">
-            ⚙ Evaluating shard placement…
+            ⚙ Evaluating leaseholder + replica placement from server_id…
           </p>
         )}
         {deadCount === 1 && (
-          <p className="text-[11px] text-emerald-400 mt-0.5">
-            ✓ Cluster operational — quorum maintained (2/3 nodes live)
+            <p className="text-[11px] text-emerald-400 mt-0.5">
+              ✓ Cluster operational — quorum maintained (3/4 nodes live), but some ranges are under-replicated
           </p>
         )}
-        {deadCount >= 2 && deadCount < 3 && (
-          <p className="text-[11px] text-red-400 mt-0.5 font-semibold animate-pulse">
-            🚨 QUORUM LOST — writes blocked ({3 - deadCount}/3 nodes live)
+        {deadCount === 2 && (
+          <p className="text-[11px] text-yellow-300 mt-0.5 font-semibold">
+            ⚠ Degraded mode — 2/4 nodes live; writes work only when a range still has 2 of its 3 replicas
           </p>
         )}
         {deadCount === 3 && (
+          <p className="text-[11px] text-red-400 mt-0.5 font-semibold animate-pulse">
+            🚨 QUORUM LOST — writes blocked ({4 - deadCount}/4 nodes live)
+          </p>
+        )}
+        {deadCount === 4 && (
           <p className="text-[11px] text-red-500 mt-0.5 font-bold">
             ☠ ALL NODES OFFLINE — cluster unreachable
           </p>
@@ -320,7 +384,7 @@ export default function ClusterPane({
         />
 
         {/* Node cards — absolutely positioned at percentage coordinates */}
-        {[1, 2, 3].map((nodeId) => (
+        {[1, 2, 3, 4].map((nodeId) => (
           <div
             key={nodeId}
             ref={(el) => { nodeRefs.current[nodeId] = el; }}
@@ -333,10 +397,13 @@ export default function ClusterPane({
           >
             <NodeCard
               nodeId={nodeId}
-              shards={nodeShards[nodeId] ?? []}
+              replicas={nodeReplicas[nodeId] ?? []}
+              rf={effectiveRf}
               evaluating={evaluating}
               highlight={nodeHighlight === nodeId}
               status={nodeStatuses[nodeId] ?? "live"}
+              deadCount={deadCount}
+              liveNodes={4 - deadCount}
               onKill={() => onKillNode?.(nodeId)}
               onRestart={() => onRestartNode?.(nodeId)}
             />
@@ -370,16 +437,22 @@ export default function ClusterPane({
             <span className="w-4 border-t border-[#5865f245]" />
           </div>
           <div className="flex items-center justify-end gap-1.5">
-            <span>Write packet → shard owner</span>
+            <span>Write packet → leaseholder route</span>
             <span className="w-3 h-2.5 rounded-full bg-[#5865f2] shadow-[0_0_6px_2px_#5865f2aa]" />
           </div>
           <div className="flex items-center justify-end gap-1.5">
-            <span>Reroute to live replica</span>
+            <span>Replica fan-out from live CockroachDB metadata (RF={effectiveRf})</span>
             <span className="w-3 h-2.5 rounded-full bg-[#23a55a] shadow-[0_0_6px_2px_#23a55aaa]" />
           </div>
           <div className="flex items-center justify-end gap-1.5">
             <span>Failed packet (dead node)</span>
             <span className="w-3 h-2.5 rounded-full bg-[#ef4444] shadow-[0_0_6px_2px_#ef444488]" />
+          </div>
+          <div className="text-[8px] text-slate-700 mt-1">
+            Note: dead nodes are not auto-replaced; they rejoin, or an operator adds a new node.
+          </div>
+          <div className="text-[8px] text-slate-700">
+            Demo note: range placement is fetched from CockroachDB SHOW RANGE metadata, not frontend hashing.
           </div>
         </div>
       </div>

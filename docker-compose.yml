@@ -1,7 +1,7 @@
 
 services:
   # ─────────────────────────────────────────────
-  # CockroachDB – Shared-Nothing Cluster (3 nodes)
+  # CockroachDB – Shared-Nothing Cluster (4 nodes)
   # Each node has its own isolated Docker volume.
   # No healthcheck needed here – db-init.sh owns
   # all timing via its own retry loops.
@@ -13,7 +13,7 @@ services:
       --insecure
       --advertise-addr=roach1
       --listen-addr=0.0.0.0
-      --join=roach1,roach2,roach3
+      --join=roach1,roach2,roach3,roach4
       --cache=.25
       --max-sql-memory=.25
     volumes:
@@ -32,7 +32,7 @@ services:
       --insecure
       --advertise-addr=roach2
       --listen-addr=0.0.0.0
-      --join=roach1,roach2,roach3
+      --join=roach1,roach2,roach3,roach4
       --cache=.25
       --max-sql-memory=.25
     volumes:
@@ -48,11 +48,27 @@ services:
       --insecure
       --advertise-addr=roach3
       --listen-addr=0.0.0.0
-      --join=roach1,roach2,roach3
+      --join=roach1,roach2,roach3,roach4
       --cache=.25
       --max-sql-memory=.25
     volumes:
       - roach3-data:/cockroach/cockroach-data
+    networks:
+      - roachnet
+    restart: unless-stopped
+
+  roach4:
+    image: cockroachdb/cockroach:v24.1.3
+    command: >
+      start
+      --insecure
+      --advertise-addr=roach4
+      --listen-addr=0.0.0.0
+      --join=roach1,roach2,roach3,roach4
+      --cache=.25
+      --max-sql-memory=.25
+    volumes:
+      - roach4-data:/cockroach/cockroach-data
     networks:
       - roachnet
     restart: unless-stopped
@@ -84,6 +100,7 @@ services:
     environment:
       DATABASE_URL: "postgresql://root@roach1:26257/discord_clone?sslmode=disable"
       PORT: "3001"
+      DEMO_MAX_MESSAGES_PER_SERVER: "120"
     ports:
       - "3001:3001"
     volumes:
@@ -113,6 +130,7 @@ volumes:
   roach1-data:
   roach2-data:
   roach3-data:
+  roach4-data:
 
 networks:
   roachnet:

@@ -5,6 +5,7 @@ export default function DiscordPane({
   selectedServer,
   messages,
   username,
+  placementByServer = {},
   onSelectServer,
   onSendMessage,
   onCreateServer,
@@ -41,12 +42,20 @@ export default function DiscordPane({
     1: "bg-blue-500",
     2: "bg-purple-500",
     3: "bg-green-500",
+    4: "bg-yellow-500",
   };
   const nodeBorder = {
     1: "border-blue-500/40",
     2: "border-purple-500/40",
     3: "border-green-500/40",
+    4: "border-yellow-500/40",
   };
+
+  function leaseholderNodeFromPlacement(serverId) {
+    const placement = placementByServer[String(serverId)] ?? placementByServer[serverId] ?? null;
+    if (Number.isInteger(placement?.leaseholderNode)) return placement.leaseholderNode;
+    return null;
+  }
 
   return (
     <div className="relative flex h-full bg-discord-bg text-discord-heading">
@@ -62,6 +71,10 @@ export default function DiscordPane({
         {/* Server list */}
         <nav className="flex-1 overflow-y-auto py-2 px-2 space-y-0.5">
           {servers.map((srv) => (
+            (() => {
+              const leaseholderNode = leaseholderNodeFromPlacement(srv.id);
+              const leaseholderLabel = Number.isInteger(leaseholderNode) ? `L${leaseholderNode}` : "L?";
+              return (
             <button
               key={srv.id}
               onClick={() => onSelectServer(srv)}
@@ -73,17 +86,19 @@ export default function DiscordPane({
                     : "text-discord-muted hover:bg-white/5 hover:text-discord-heading"
                 }`}
             >
-              {/* coloured dot = which node owns this shard */}
+              {/* coloured dot = live leaseholder node from DB metadata */}
               <span
                 className={`w-2 h-2 rounded-full flex-shrink-0 ${
-                  nodeColor[srv.node_id] ?? "bg-gray-500"
+                  nodeColor[leaseholderNode] ?? "bg-gray-500"
                 }`}
               />
               <span className="truncate">{srv.name}</span>
               <span className="ml-auto text-[9px] text-discord-muted opacity-60">
-                N{srv.node_id}
+                {leaseholderLabel} · RF3
               </span>
             </button>
+              );
+            })()
           ))}
 
           {servers.length === 0 && (
@@ -119,13 +134,19 @@ export default function DiscordPane({
             {selectedServer ? selectedServer.name : "Select a server"}
           </span>
           {selectedServer && (
+            (() => {
+              const leaseholderNode = leaseholderNodeFromPlacement(selectedServer.id);
+              const leaseholderLabel = Number.isInteger(leaseholderNode) ? `L${leaseholderNode}` : "L?";
+              return (
             <span
               className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full
-                border ${nodeBorder[selectedServer.node_id] ?? "border-gray-500/40"}
+                border ${nodeBorder[leaseholderNode] ?? "border-gray-500/40"}
                 text-discord-muted`}
             >
-              Node {selectedServer.node_id}
+              Leaseholder {leaseholderLabel} · RF3
             </span>
+              );
+            })()
           )}
         </header>
 
@@ -192,8 +213,8 @@ export default function DiscordPane({
             border border-white/10 animate-fadeIn">
             <h2 className="text-lg font-bold mb-1">Create a Server</h2>
             <p className="text-discord-muted text-sm mb-4">
-              The cluster will automatically assign this shard to the
-              least-loaded node.
+              CockroachDB chooses a leaseholder and keeps 3 replicas by default.
+              This UI reads live leaseholder/replica placement from CockroachDB metadata.
             </p>
             <form onSubmit={handleCreate}>
               <input
@@ -223,7 +244,7 @@ export default function DiscordPane({
                     bg-discord-accent hover:bg-discord-accent/80
                     disabled:opacity-40 transition-colors"
                 >
-                  Create &amp; Assign
+                  Create &amp; Route
                 </button>
               </div>
             </form>

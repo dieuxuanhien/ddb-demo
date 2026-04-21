@@ -1,11 +1,10 @@
-# CockroachDB Sharding Demo
+# CockroachDB Replica Placement Demo
 
 A full-stack web application that demonstrates **distributed database concepts** —
-shared-nothing architecture, horizontal fragmentation (sharding), and dynamic
-shard allocation — using a real 3-node CockroachDB cluster running entirely in
-Docker.
+shared-nothing architecture, leaseholder-based routing, and 3-way replica
+placement using a real 3-node CockroachDB cluster running entirely in Docker.
 
-```
+```text
 ┌────────────────────────┬───────────────────────────────┐
 │  Discord-like UI       │  CockroachDB Cluster          │
 │  (Left pane)           │  (Right pane)                 │
@@ -14,10 +13,10 @@ Docker.
 │  • Send messages       │       \      /                │
 │  • Create new servers  │        Node 3                 │
 │                        │                               │
-│  Sending a message →   │  Animated packet flies to     │
-│                        │  the node that owns the shard │
-│  Creating a server →   │  Cluster evaluates load,      │
-│                        │  assigns shard to least-used  │
+│  Sending a message →   │  Animated packet reaches the  │
+│                        │  leaseholder, then fans out   │
+│  Creating a server →   │  Cluster assigns leaseholder  │
+│                        │  and shows 3 replicas         │
 └────────────────────────┴───────────────────────────────┘
 ```
 
@@ -39,18 +38,14 @@ Each CockroachDB node has its own **isolated Docker volume** (`roach1-data`,
 the shared-nothing principle: each node owns its own disk and processes its own
 data independently.
 
-### Shard Mapping
+### Replica Placement
 
-The `servers` table has a `node_id` column that records which node "owns" the
-shard for the purposes of this visualisation:
+The demo now models CockroachDB-style placement:
 
-| Server  | Node | Docker volume  |
-|---------|------|----------------|
-| General | 1    | roach1-data    |
-| Random  | 2    | roach2-data    |
-| (new)   | 3*   | roach3-data    |
-
-*New servers are placed on the least-loaded node (fewest existing shards).
+- `servers.id` determines the leaseholder used for the visual route.
+- `messages` uses `PRIMARY KEY (server_id, id)`, so rows are physically keyed by `server_id` first.
+- Every server is visualized as replicated on all 3 nodes (RF=3).
+- The leaseholder is only a visual routing hint; real CockroachDB can move it.
 
 ---
 
@@ -77,30 +72,33 @@ docker compose up --build
 # Watch for: "✓ API server listening on http://0.0.0.0:3001"
 ```
 
-| URL                        | What                              |
-|----------------------------|-----------------------------------|
-| http://localhost:3000      | The demo application              |
-| http://localhost:8080      | CockroachDB Admin UI              |
-| http://localhost:3001/health | Backend health check            |
+### Open the app
+
+- [http://localhost:3000](http://localhost:3000) — The demo application
+- [http://localhost:8080](http://localhost:8080) — CockroachDB Admin UI
+- [http://localhost:3001/health](http://localhost:3001/health) — Backend health check
 
 ---
 
 ## Running the demo
 
 ### Send a message
+
 1. Select **General** or **Random** in the left sidebar.
 2. Type something in the input box and press **Enter** or ↵.
-3. **Watch** the right pane: a glowing blue packet flies from the client
-   indicator to the node that owns that server's shard, and the activity log
-   updates.
+3. **Watch** the right pane:
+   1. A glowing blue packet reaches the leaseholder.
+   2. Green packets fan out to the other replicas.
+   3. The activity log updates.
 
 ### Create a new server
+
 1. Click **Create Server** at the bottom of the sidebar.
-2. Enter a name (e.g. `Images`) and click **Create & Assign**.
+2. Enter a name (e.g. `Images`) and click **Create & Route**.
 3. **Watch** the right pane:
-   - All three nodes pulse yellow – the cluster is *evaluating* shard placement.
-   - After ~2 s, a green packet flies to the winning node (least loaded).
-   - The shard label appears on that node.
+   1. All three nodes pulse yellow — the cluster is *evaluating* replica placement.
+   2. After ~2 s, the leaseholder is highlighted and the other 2 replicas follow.
+   3. The server label appears under all three nodes in the visualization.
 4. The new server is immediately selected; you can send messages to it.
 
 ---
@@ -143,7 +141,7 @@ Vite proxies `/api` requests to the backend on port 3001.
 
 ## File structure
 
-```
+```text
 discord-demo/
 ├── docker-compose.yml        # Full-stack orchestration
 ├── db/
@@ -174,16 +172,14 @@ docker compose down
 
 # Stop AND wipe all data (fresh start)
 docker compose down -v
-```
+```text
 
 ---
 
 ## Concepts illustrated
 
-| Concept                       | Where you see it                                              |
-|-------------------------------|---------------------------------------------------------------|
-| **Shared-Nothing**            | Each node has its own Docker volume; no shared disk          |
-| **Horizontal Fragmentation**  | `servers` rows each carry a `node_id` (their shard owner)    |
-| **Dynamic Shard Allocation**  | New server → backend queries node counts → assigns to min    |
-| **Shard Routing**             | Message write → animates to the node that owns that shard    |
-| **Replication Channel**       | Dashed lines between nodes represent Raft protocol traffic   |
+* **Shared-Nothing** — Each node has its own Docker volume; no shared disk.
+* **Horizontal Fragmentation** — `messages` key starts with `server_id` (`PRIMARY KEY (server_id, id)`).
+* **Leaseholder Routing (Demo)** — UI highlights the leaseholder chosen from `server_id`.
+* **Replication** — Message write animates to 3 replicas across the cluster.
+* **Replication Channel** — Dashed lines between nodes represent Raft protocol traffic.

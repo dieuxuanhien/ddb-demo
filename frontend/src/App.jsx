@@ -13,7 +13,8 @@ export default function App() {
   const [evaluating, setEvaluating]         = useState(false);
   const [nodeHighlight, setNodeHighlight]   = useState(null);
   const [activityLog, setActivityLog]       = useState([]);
-  const [nodeStatuses, setNodeStatuses]     = useState({ 1: "live", 2: "live", 3: "live" });
+  const [nodeStatuses, setNodeStatuses]     = useState({ 1: "live", 2: "live", 3: "live", 4: "live" });
+  const [placements, setPlacements]         = useState({});
   const [username]                          = useState("User" + Math.floor(Math.random() * 9000 + 1000));
 
   const pollRef         = useRef(null);
@@ -40,6 +41,35 @@ export default function App() {
     return id;
   }
 
+  const getPlacement = useCallback((serverId) => {
+    const key = String(serverId);
+    return placements[key] ?? placements[serverId] ?? null;
+  }, [placements]);
+
+  const getReplicaNodes = useCallback((serverId) => {
+    const placement = getPlacement(serverId);
+    const effective = placement?.effectiveReplicas;
+    const voting = placement?.votingReplicas;
+    const replicas = placement?.replicas;
+    const fromDB = Array.isArray(effective) && effective.length > 0
+      ? effective
+      : Array.isArray(voting) && voting.length > 0
+        ? voting
+        : Array.isArray(replicas) && replicas.length > 0
+          ? replicas
+          : null;
+
+    if (fromDB) return fromDB;
+    return [];
+  }, [getPlacement]);
+
+  const getLeaseholderNode = useCallback((serverId) => {
+    const placement = getPlacement(serverId);
+    if (Number.isInteger(placement?.leaseholderNode)) return placement.leaseholderNode;
+    const replicas = getReplicaNodes(serverId);
+    return replicas[0] ?? null;
+  }, [getPlacement, getReplicaNodes]);
+
   // ── data fetching ──────────────────────────────────────────────────────────
 
   const fetchServers = useCallback(async () => {
@@ -64,6 +94,25 @@ export default function App() {
     } catch (err) { console.error("fetchMessages:", err); }
   }, []);
 
+  const fetchPlacements = useCallback(async (serverIds) => {
+    try {
+      if (!Array.isArray(serverIds) || serverIds.length === 0) {
+        setPlacements({});
+        return {};
+      }
+      const qs = serverIds.map((id) => String(id)).join(",");
+      const res = await fetch(`${API}/placements?server_ids=${encodeURIComponent(qs)}`);
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      const nextPlacements = data.placements ?? {};
+      setPlacements(nextPlacements);
+      return nextPlacements;
+    } catch (err) {
+      console.error("fetchPlacements:", err);
+      return {};
+    }
+  }, []);
+
   const fetchNodeStatuses = useCallback(async () => {
     try {
       const res = await fetch(`${API}/nodes/status`);
@@ -71,7 +120,7 @@ export default function App() {
       const data = await res.json();
       setNodeStatuses((prev) => {
         // detect transitions live→dead for log entries
-        for (const id of [1, 2, 3]) {
+        for (const id of [1, 2, 3, 4]) {
           if (prev[id] === "live"     && data[id] === "dead")    log(`💀 Node ${id} went offline`);
           if (prev[id] === "dead"     && data[id] === "live")    log(`✅ Node ${id} is back online`);
           if (prev[id] === "starting" && data[id] === "live")    log(`✅ Node ${id} recovered`);
@@ -89,14 +138,25 @@ export default function App() {
     clearInterval(pollRef.current);
     if (!selectedServer) { setMessages([]); return; }
     fetchMessages(selectedServer.id);
-    pollRef.current = setInterval(() => fetchMessages(selectedServer.id), 2000);
+    pollRef.current = setInterval(() => fetchMessages(selectedServer.id), 3000);
     return () => clearInterval(pollRef.current);
   }, [selectedServer, fetchMessages]);
 
-  // Poll node statuses every 2 s
+  useEffect(() => {
+    if (!servers.length) {
+      setPlacements({});
+      return;
+    }
+    const serverIds = servers.map((s) => s.id);
+    fetchPlacements(serverIds);
+    const t = setInterval(() => fetchPlacements(serverIds), 5000);
+    return () => clearInterval(t);
+  }, [servers, fetchPlacements]);
+
+  // Poll node statuses every 3 s
   useEffect(() => {
     fetchNodeStatuses();
-    const t = setInterval(fetchNodeStatuses, 2000);
+    const t = setInterval(fetchNodeStatuses, 3000);
     return () => clearInterval(t);
   }, [fetchNodeStatuses]);
 
@@ -109,23 +169,50 @@ export default function App() {
 
   const handleSendMessage = useCallback(async (content) => {
     if (!selectedServer || !content.trim()) return;
-    const targetNode  = selectedServer.node_id;
-    const statuses    = nodeStatusesRef.current;
-    const targetDead  = statuses[targetNode] === "dead";
+    let replicaNodes = getReplicaNodes(selectedServer.id);
+    let leaseholderNode = getLeaseholderNode(selectedServer.id);
 
-    if (targetDead) {
-      // Show failed attempt to dead node, then reroute to a live replica
-      spawnPacket(targetNode, "#ef4444");
-      const liveNode = [1, 2, 3].find((id) => id !== targetNode && statuses[id] === "live");
+    if (!leaseholderNode || replicaNodes.length === 0) {
+      const freshPlacements = await fetchPlacements([selectedServer.id]);
+      const placement = freshPlacements[String(selectedServer.id)] ?? null;
+      const effective = placement?.effectiveReplicas ?? placement?.votingReplicas ?? placement?.replicas ?? [];
+      replicaNodes = Array.isArray(effective) ? effective : [];
+      leaseholderNode = Number.isInteger(placement?.leaseholderNode) ? placement.leaseholderNode : (replicaNodes[0] ?? null);
+    }
+
+    const statuses    = nodeStatusesRef.current;
+    if (!leaseholderNode || replicaNodes.length === 0) {
+      log(`⚠ Placement metadata not ready for server_id=${selectedServer.id}; writing without animation`);
+    }
+    const targetDead  = statuses[leaseholderNode] === "dead";
+
+    if (leaseholderNode && replicaNodes.length > 0 && targetDead) {
+      // Visual: request aimed at a down leaseholder node, then routed via a live gateway.
+      spawnPacket(leaseholderNode, "#ef4444");
+      const liveNode = replicaNodes.find((id) => id !== leaseholderNode && statuses[id] === "live");
       if (liveNode) {
         setTimeout(() => spawnPacket(liveNode, "#23a55a"), 700);
-        log(`⚡ Node ${targetNode} offline — CockroachDB rerouting to Node ${liveNode} (live replica)`);
+        setTimeout(() => {
+          replicaNodes
+            .filter((id) => id !== leaseholderNode && id !== liveNode && statuses[id] === "live")
+            .forEach((id, index) => {
+              setTimeout(() => spawnPacket(id, "#23a55a", liveNode), index * 220);
+            });
+        }, 900);
+        log(`⚡ Leaseholder Node ${leaseholderNode} offline — retry via Node ${liveNode}; surviving replicas stay in sync`);
       } else {
         log(`⚠ No live nodes available — write may fail`);
       }
-    } else {
-      spawnPacket(targetNode, "#5865f2");
-      log(`📨 Writing to Node ${targetNode} (shard: "${selectedServer.name}")`);
+    } else if (leaseholderNode && replicaNodes.length > 0) {
+      spawnPacket(leaseholderNode, "#5865f2");
+      setTimeout(() => {
+        replicaNodes
+          .filter((id) => id !== leaseholderNode)
+          .forEach((id, index) => {
+            setTimeout(() => spawnPacket(id, "#23a55a", leaseholderNode), index * 220);
+          });
+      }, 250);
+      log(`📨 Writing to leaseholder Node ${leaseholderNode}; replicating server_id=${selectedServer.id} to ${Math.max(replicaNodes.length - 1, 0)} follower nodes`);
     }
 
     try {
@@ -141,29 +228,15 @@ export default function App() {
       console.error("sendMessage:", err);
       log(`❌ Error: ${err.message}`);
     }
-  }, [selectedServer, username, log]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedServer, username, log, getLeaseholderNode, getReplicaNodes]);
 
   const handleCreateServer = useCallback(async (name) => {
     if (!name.trim()) return;
-    log(`🔍 Cluster evaluating shard allocation for "${name}"...`);
+    log(`🔍 Cluster assigning leaseholder and 3 replicas for "${name}" from server_id...`);
     setEvaluating(true);
-
-    // Only assign to live nodes
-    const statuses = nodeStatusesRef.current;
-    const liveNodes = [1, 2, 3].filter((id) => statuses[id] !== "dead");
-    const counts = Object.fromEntries(liveNodes.map((id) => [id, 0]));
-    servers.forEach((s) => { if (counts[s.node_id] !== undefined) counts[s.node_id]++; });
-    const targetNode = Number(
-      Object.entries(counts).sort(([, a], [, b]) => a - b)[0]?.[0] || 1
-    );
 
     await new Promise((r) => setTimeout(r, 1800));
     setEvaluating(false);
-
-    spawnPacket(targetNode, "#23a55a");
-    setNodeHighlight(targetNode);
-    setTimeout(() => setNodeHighlight(null), 2000);
-    log(`✅ Shard "${name}" assigned to Node ${targetNode}`);
 
     try {
       const res = await fetch(`${API}/servers`, {
@@ -183,20 +256,43 @@ export default function App() {
         throw new Error(errorMsg);
       }
       const newServer = await res.json();
+      if (newServer?.splitCreated) {
+        log(`✂️ Range split created at key (server_id=${newServer.id}, id=0)`);
+      }
+      const responsePlacement = newServer?.placement ?? null;
+      const freshPlacements = await fetchPlacements([newServer.id]);
+      const placement = responsePlacement ?? freshPlacements[String(newServer.id)] ?? null;
+      const effective = placement?.effectiveReplicas ?? placement?.votingReplicas ?? placement?.replicas ?? [];
+      const replicaNodes = Array.isArray(effective) ? effective : [];
+      const targetNode = Number.isInteger(placement?.leaseholderNode) ? placement.leaseholderNode : (replicaNodes[0] ?? null);
+
+      if (targetNode) {
+        spawnPacket(targetNode, "#23a55a");
+        setTimeout(() => {
+          replicaNodes.filter((id) => id !== targetNode).forEach((id, index) => {
+            setTimeout(() => spawnPacket(id, "#23a55a", targetNode), index * 220);
+          });
+        }, 250);
+        setNodeHighlight(targetNode);
+        setTimeout(() => setNodeHighlight(null), 2000);
+        log(`✅ split+scatter applied: server_id=${newServer.id} now maps to range ${placement?.rangeId ?? "?"}, leaseholder Node ${targetNode}`);
+      } else {
+        log(`ℹ Server created; placement metadata still warming up from CockroachDB`);
+      }
       await fetchServers();
       handleSelectServer(newServer);
-      log(`🎉 Server "${newServer.name}" is live on Node ${newServer.node_id}`);
+      log(`🎉 Server "${newServer.name}" created (visualization now uses real DB placement)`);
     } catch (err) {
       console.error("createServer:", err);
       log(`❌ Could not create server: ${err.message}`);
       setEvaluating(false);
     }
-  }, [servers, fetchServers, handleSelectServer, log]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [fetchServers, fetchPlacements, getReplicaNodes, handleSelectServer, log]);
 
   const handleKillNode = useCallback(async (nodeId) => {
     // Capture live state BEFORE the optimistic update
     const currentStatuses = nodeStatusesRef.current;
-    const liveAfterKill = [1, 2, 3].filter(
+    const liveAfterKill = [1, 2, 3, 4].filter(
       (id) => id !== nodeId && currentStatuses[id] !== "dead"
     );
     const quorumLost = liveAfterKill.length < 2;
@@ -219,8 +315,8 @@ export default function App() {
         const [primary, secondary] = liveAfterKill;
 
         setTimeout(() => {
-          log(`🗳 Raft: Node ${primary} initiating leaseholder election for vacated ranges`);
-          // Raft election packet: primary → secondary
+          log(`🗳 Raft: surviving replicas on Nodes ${primary} and ${secondary} start election for affected ranges`);
+          // Election traffic between surviving replicas.
           spawnPacket(secondary, "#a855f7", primary);
         }, 850);
 
@@ -230,17 +326,17 @@ export default function App() {
         }, 1150);
 
         setTimeout(() => {
-          log(`👑 Raft: Node ${primary} elected — range leases transferred from Node ${nodeId}`);
+          log(`👑 Raft: Node ${primary} becomes leaseholder for some ranges; leadership is redistributed`);
         }, 1500);
 
         setTimeout(() => {
-          log(`✅ Lease transfer complete — cluster operational (${liveAfterKill.length}/3 nodes)`);
+          log(`✅ Cluster still writable with quorum (${liveAfterKill.length}/4 nodes live); ranges remain replicated but under the ideal 3x factor until Node ${nodeId} returns`);
         }, 2000);
 
       } else if (liveAfterKill.length === 1) {
         const survivor = liveAfterKill[0];
         setTimeout(() => {
-          log(`🚨 QUORUM LOST — only Node ${survivor} remains (need 2/3 for consensus)`);
+          log(`🚨 QUORUM LOST — only Node ${survivor} remains (need 2/3 replicas for consensus)`);
         }, 600);
         setTimeout(() => {
           log(`📖 Node ${survivor}: serving stale reads from local replicas — writes blocked`);
@@ -264,7 +360,7 @@ export default function App() {
     try {
       const res = await fetch(`${API}/nodes/${nodeId}/start`, { method: "POST" });
       if (!res.ok) throw new Error(await res.text());
-      log(`⏳ Node ${nodeId} is coming back online…`);
+      log(`⏳ Node ${nodeId} is coming back online — CockroachDB will rebalance replicas automatically`);
     } catch (err) {
       log(`❌ Restart failed: ${err.message}`);
       setNodeStatuses((prev) => ({ ...prev, [nodeId]: "dead" }));
@@ -281,6 +377,7 @@ export default function App() {
           selectedServer={selectedServer}
           messages={messages}
           username={username}
+          placementByServer={placements}
           onSelectServer={handleSelectServer}
           onSendMessage={handleSendMessage}
           onCreateServer={handleCreateServer}
@@ -294,6 +391,7 @@ export default function App() {
           nodeHighlight={nodeHighlight}
           activityLog={activityLog}
           nodeStatuses={nodeStatuses}
+          placementByServer={placements}
           onPacketDone={removePacket}
           onKillNode={handleKillNode}
           onRestartNode={handleRestartNode}
