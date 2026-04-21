@@ -94,7 +94,7 @@ export default function DiscordPane({
               />
               <span className="truncate">{srv.name}</span>
               <span className="ml-auto text-[9px] text-discord-muted opacity-60">
-                {leaseholderLabel} · RF3
+                {leaseholderLabel} · RF4
               </span>
             </button>
               );
@@ -143,7 +143,7 @@ export default function DiscordPane({
                 border ${nodeBorder[leaseholderNode] ?? "border-gray-500/40"}
                 text-discord-muted`}
             >
-              Leaseholder {leaseholderLabel} · RF3
+              Leaseholder {leaseholderLabel} · RF4
             </span>
               );
             })()

@@ -98,6 +98,39 @@ async function splitRangeForServer(serverId) {
   if (!validateServerId(serverId)) return false;
   try {
     await queryDB(`ALTER TABLE messages SPLIT AT VALUES (${serverId}, 0)`);
+
+    // Choose leaseholder node with the least current leaseholders for even distribution
+    const allServers = await queryDB("SELECT id FROM servers ORDER BY id");
+    const serverIds = allServers.rows.map(r => String(r.id));
+    const placements = {};
+    for (const id of serverIds) {
+      const p = await getRangePlacementForServer(id);
+      if (p) placements[id] = p;
+    }
+
+    // Count leaseholders per node
+    const leaseholderCount = { 1: 0, 2: 0, 3: 0, 4: 0 };
+    for (const p of Object.values(placements)) {
+      if (p.leaseholderNode && leaseholderCount[p.leaseholderNode] !== undefined) {
+        leaseholderCount[p.leaseholderNode]++;
+      }
+    }
+
+    // Find node with least leaseholders
+    let minCount = Infinity;
+    let targetNode = 1;
+    for (const [node, count] of Object.entries(leaseholderCount)) {
+      if (count < minCount) {
+        minCount = count;
+        targetNode = Number(node);
+      }
+    }
+
+    const placement = await getRangePlacementForServer(serverId);
+    if (placement && placement.rangeId) {
+      await queryDB(`ALTER RANGE ${placement.rangeId} RELOCATE LEASE TO ${targetNode}`);
+    }
+
     return true;
   } catch (err) {
     if (isIgnorableSplitError(err)) return false;
@@ -106,7 +139,7 @@ async function splitRangeForServer(serverId) {
 }
 
 async function scatterMessageRanges() {
-  // SCATTER randomizes leaseholders/replica placement across nodes for demo visibility.
+  // Light scatter to balance replicas, but leaseholders are now controlled by splitRangeForServer
   await queryDB("ALTER TABLE messages SCATTER");
 }
 
@@ -139,7 +172,7 @@ async function ensureSchema() {
 
   await queryDB(`
     CREATE TABLE IF NOT EXISTS servers (
-      id INT DEFAULT unique_rowid() PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       name TEXT NOT NULL
     )
   `);
@@ -171,11 +204,11 @@ async function ensureSchema() {
 
   await ensureDemoTuning();
 
-  await queryDB(`
-    INSERT INTO servers (name)
-    VALUES ('General'), ('Random')
-    ON CONFLICT (name) DO NOTHING
-  `);
+  // await queryDB(`
+  //   INSERT INTO servers (name)
+  //   VALUES ('General'), ('Random')
+  //   ON CONFLICT (name) DO NOTHING
+  // `);
 
   await ensureServerRangeSplits();
 
@@ -187,7 +220,7 @@ async function ensureDemoTuning() {
   // allowed value to keep demo splits easier to trigger than defaults.
   await queryDB(`
     ALTER TABLE messages CONFIGURE ZONE USING
-      num_replicas = 3,
+      num_replicas = 4,
       range_min_bytes = 33554432,
       range_max_bytes = 67108864,
       gc.ttlseconds = 600

@@ -27,6 +27,3 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_server_id_idx ON messages (server_id, timestamp DESC);
 
 -- seed data ────────────────────────────────────────────────────────────────
-INSERT INTO servers (name)
-VALUES ('General'), ('Random')
-ON CONFLICT (name) DO NOTHING;
