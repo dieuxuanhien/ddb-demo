@@ -359,7 +359,7 @@ export default function ClusterPane({
         )}
         {deadCount === 2 && (
           <p className="text-[11px] text-yellow-300 mt-0.5 font-semibold">
-            ⚠ Degraded mode — 2/4 nodes live; writes work only when a range still has 2 of its 3 replicas
+            ⚠ Quorum LOST — 2/4 nodes live;
           </p>
         )}
         {deadCount === 3 && (

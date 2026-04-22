@@ -32,6 +32,27 @@ const ADMIN_DB_URLS = DB_URLS.map((u) => {
 });
 const adminPools = ADMIN_DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 3000 }));
 
+let liveNodeCache = { at: 0, ids: [] };
+async function getCachedLiveNodeIds(ttlMs = 1500) {
+  const now = Date.now();
+  if (now - liveNodeCache.at < ttlMs) {
+    return liveNodeCache.ids;
+  }
+  const ids = await getLiveNodeIds();
+  liveNodeCache = { at: now, ids };
+  return ids;
+}
+
+async function getPreferredNodeOrder() {
+  const liveIds = await getCachedLiveNodeIds();
+  const liveSet = new Set(liveIds);
+  const preferred = liveIds.slice();
+  for (const id of [1, 2, 3, 4]) {
+    if (!liveSet.has(id)) preferred.push(id);
+  }
+  return preferred;
+}
+
 for (const [idx, pool] of pools.entries()) {
   pool.on("error", (err) => {
     console.warn(`DB pool[${idx + 1}] idle client error: ${err.message}`);
@@ -46,7 +67,9 @@ for (const [idx, pool] of adminPools.entries()) {
 
 async function queryDB(text, params) {
   const errs = [];
-  for (const pool of pools) {
+  const order = await getPreferredNodeOrder();
+  for (const nodeId of order) {
+    const pool = pools[nodeId - 1];
     try { return await pool.query(text, params); }
     catch (e) { errs.push(e.message); }
   }
@@ -55,7 +78,9 @@ async function queryDB(text, params) {
 
 async function queryAdmin(text, params) {
   const errs = [];
-  for (const pool of adminPools) {
+  const order = await getPreferredNodeOrder();
+  for (const nodeId of order) {
+    const pool = adminPools[nodeId - 1];
     try { return await pool.query(text, params); }
     catch (e) { errs.push(e.message); }
   }
@@ -375,6 +400,9 @@ async function rebalanceAllLeaseholders() {
   try {
     const liveNodeSet = new Set(await getLiveNodeIds());
     if (liveNodeSet.size === 0) return { checked: 0, moved: 0, error: "no live nodes" };
+    if (liveNodeSet.size < 3) {
+      return { checked: 0, moved: 0, skipped: "cluster degraded; rebalance paused" };
+    }
 
     const { rows } = await queryDB("SELECT id FROM servers ORDER BY id");
 
@@ -620,7 +648,9 @@ app.post("/api/messages", async (req, res) => {
          AND m.id = r.id
          AND r.rn > $2`,
       [server_id, DEMO_MAX_MESSAGES_PER_SERVER]
-    );
+    ).catch((err) => {
+      console.warn(`Non-fatal message retention cleanup failed for server_id=${server_id}: ${err.message}`);
+    });
 
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -648,8 +678,12 @@ app.get("/api/placements", async (req, res) => {
     const placements = {};
     for (const id of serverIds) {
       if (!validateServerId(id)) continue;
-      const placement = await getRangePlacementForServer(id);
-      if (placement) placements[id] = withEffectiveLeaseholder(placement, liveNodeSet);
+      try {
+        const placement = await getRangePlacementForServer(id);
+        if (placement) placements[id] = withEffectiveLeaseholder(placement, liveNodeSet);
+      } catch (err) {
+        console.warn(`Placement lookup failed for server_id=${id}: ${err.message}`);
+      }
     }
 
     res.json({
