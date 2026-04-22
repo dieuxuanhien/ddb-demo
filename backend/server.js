@@ -22,28 +22,65 @@ const DB_URLS = [
   "postgresql://root@roach2:26257/discord_clone?sslmode=disable",
   "postgresql://root@roach3:26257/discord_clone?sslmode=disable",
 ];
-const pools = DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 3000 }));
+const pools = DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 1000 }));
 const ADMIN_DB_URLS = DB_URLS.map((u) => {
   const parsed = new URL(u);
   parsed.pathname = "/defaultdb";
   return parsed.toString();
 });
-const adminPools = ADMIN_DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 3000 }));
+const adminPools = ADMIN_DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 1000 }));
+const NODE_IDS = [1, 2, 3];
+const nodeBackoffUntil = { 1: 0, 2: 0, 3: 0 };
+let lastHealthyNode = 1;
+let serversCache = [];
+const messagesCache = new Map();
 
-async function queryDB(text, params) {
+function orderedNodeIds(preferredNode) {
+  const unique = [];
+  const pushUnique = (id) => {
+    const n = Number(id);
+    if (NODE_IDS.includes(n) && !unique.includes(n)) unique.push(n);
+  };
+  pushUnique(preferredNode);
+  pushUnique(lastHealthyNode);
+  NODE_IDS.forEach(pushUnique);
+
+  const now = Date.now();
+  const healthy = unique.filter((id) => nodeBackoffUntil[id] <= now);
+  return healthy.length > 0 ? [...healthy, ...unique.filter((id) => nodeBackoffUntil[id] > now)] : unique;
+}
+
+async function queryDB(text, params, options = {}) {
   const errs = [];
-  for (const pool of pools) {
-    try { return await pool.query(text, params); }
-    catch (e) { errs.push(e.message); }
+  for (const nodeId of orderedNodeIds(options.preferredNode)) {
+    const pool = pools[nodeId - 1];
+    try {
+      const result = await pool.query(text, params);
+      nodeBackoffUntil[nodeId] = 0;
+      lastHealthyNode = nodeId;
+      return result;
+    }
+    catch (e) {
+      nodeBackoffUntil[nodeId] = Date.now() + 5000;
+      errs.push(`[roach${nodeId}] ${e.message}`);
+    }
   }
   throw new Error(`All nodes unavailable: ${errs.join(" | ")}`);
 }
 
-async function queryAdmin(text, params) {
+async function queryAdmin(text, params, options = {}) {
   const errs = [];
-  for (const pool of adminPools) {
-    try { return await pool.query(text, params); }
-    catch (e) { errs.push(e.message); }
+  for (const nodeId of orderedNodeIds(options.preferredNode)) {
+    const pool = adminPools[nodeId - 1];
+    try {
+      const result = await pool.query(text, params);
+      nodeBackoffUntil[nodeId] = 0;
+      lastHealthyNode = nodeId;
+      return result;
+    } catch (e) {
+      nodeBackoffUntil[nodeId] = Date.now() + 5000;
+      errs.push(`[roach${nodeId}] ${e.message}`);
+    }
   }
   throw new Error(`All admin connections unavailable: ${errs.join(" | ")}`);
 }
@@ -191,9 +228,13 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 app.get("/api/servers", async (_req, res) => {
   try {
     const { rows } = await queryDB("SELECT id, name, node_id FROM servers ORDER BY id");
+    serversCache = rows;
     res.json(rows);
   } catch (err) {
     console.error(err);
+    if (serversCache.length > 0) {
+      return res.json(serversCache);
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -215,6 +256,7 @@ app.post("/api/servers", async (req, res) => {
       "INSERT INTO servers (name, node_id) VALUES ($1, $2) RETURNING id, name, node_id",
       [name.trim(), targetNode]
     );
+    serversCache = [...serversCache.filter((s) => String(s.id) !== String(rows[0].id)), rows[0]];
     res.status(201).json(rows[0]);
   } catch (err) {
     if (err.code === "23505") return res.status(409).json({ error: "Server name already exists" });
@@ -227,16 +269,22 @@ app.post("/api/servers", async (req, res) => {
 
 app.get("/api/servers/:id/messages", async (req, res) => {
   const serverId = req.params.id;
+  const preferredNode = Number(req.query.preferredNode);
   if (!/^\d+$/.test(serverId)) return res.status(400).json({ error: "invalid server id" });
   try {
     const { rows } = await queryDB(
       `SELECT id, server_id, username, content, timestamp
        FROM messages WHERE server_id = $1 ORDER BY timestamp ASC`,
-      [serverId]
+      [serverId],
+      { preferredNode }
     );
+    messagesCache.set(String(serverId), rows);
     res.json(rows);
   } catch (err) {
     console.error(err);
+    if (messagesCache.has(String(serverId))) {
+      return res.json(messagesCache.get(String(serverId)));
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -244,15 +292,19 @@ app.get("/api/servers/:id/messages", async (req, res) => {
 // ── /api/messages ──────────────────────────────────────────────────────────
 
 app.post("/api/messages", async (req, res) => {
-  const { server_id, username, content } = req.body;
+  const { server_id, username, content, preferred_node_id } = req.body;
   if (!server_id || !content) return res.status(400).json({ error: "server_id and content are required" });
   try {
     const { rows } = await queryDB(
       `INSERT INTO messages (server_id, username, content)
        VALUES ($1, $2, $3)
        RETURNING id, server_id, username, content, timestamp`,
-      [server_id, username || "User", content]
+      [server_id, username || "User", content],
+      { preferredNode: Number(preferred_node_id) }
     );
+    const cacheKey = String(server_id);
+    const prior = messagesCache.get(cacheKey) || [];
+    messagesCache.set(cacheKey, [...prior, rows[0]]);
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error(err);
