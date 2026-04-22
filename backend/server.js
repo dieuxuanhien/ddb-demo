@@ -22,24 +22,25 @@ const DB_URLS = [
   "postgresql://root@roach2:26257/discord_clone?sslmode=disable",
   "postgresql://root@roach3:26257/discord_clone?sslmode=disable",
 ];
-const pools = DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 1000 }));
+const pools = DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 2000 }));
 const ADMIN_DB_URLS = DB_URLS.map((u) => {
   const parsed = new URL(u);
   parsed.pathname = "/defaultdb";
   return parsed.toString();
 });
-const adminPools = ADMIN_DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 1000 }));
+const adminPools = ADMIN_DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 2000 }));
 const NODE_IDS = [1, 2, 3];
 const nodeBackoffUntil = { 1: 0, 2: 0, 3: 0 };
 let lastHealthyNode = 1;
 let serversCache = [];
 const messagesCache = new Map();
 const NODE_BACKOFF_MS = 5000;
-const MAX_CACHED_SERVERS = 50;
+const MAX_CACHED_MESSAGE_SERVER_KEYS = 50;
+const MAX_CACHED_SERVER_ROWS = 2000;
 
 function setMessagesCache(serverId, rows) {
   const key = String(serverId);
-  if (!messagesCache.has(key) && messagesCache.size >= MAX_CACHED_SERVERS) {
+  if (!messagesCache.has(key) && messagesCache.size >= MAX_CACHED_MESSAGE_SERVER_KEYS) {
     const oldestKey = messagesCache.keys().next().value;
     if (oldestKey) messagesCache.delete(oldestKey);
   }
@@ -249,7 +250,7 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 app.get("/api/servers", async (_req, res) => {
   try {
     const { rows } = await queryDB("SELECT id, name, node_id FROM servers ORDER BY id");
-    serversCache = rows;
+    serversCache = rows.slice(-MAX_CACHED_SERVER_ROWS);
     res.json(rows);
   } catch (err) {
     console.error(err);
@@ -277,7 +278,7 @@ app.post("/api/servers", async (req, res) => {
       "INSERT INTO servers (name, node_id) VALUES ($1, $2) RETURNING id, name, node_id",
       [name.trim(), targetNode]
     );
-    serversCache = [...serversCache, rows[0]];
+    serversCache = [...serversCache, rows[0]].slice(-MAX_CACHED_SERVER_ROWS);
     res.status(201).json(rows[0]);
   } catch (err) {
     if (err.code === "23505") return res.status(409).json({ error: "Server name already exists" });
