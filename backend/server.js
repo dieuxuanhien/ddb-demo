@@ -35,8 +35,26 @@ let lastHealthyNode = 1;
 let serversCache = [];
 const messagesCache = new Map();
 const NODE_BACKOFF_MS = 5000;
-// Keep fallback payloads bounded while still preserving recent chat context during outages.
-const MAX_CACHED_MESSAGES_PER_SERVER = 500;
+const MAX_CACHED_SERVERS = 50;
+
+function setMessagesCache(serverId, rows) {
+  const key = String(serverId);
+  if (!messagesCache.has(key) && messagesCache.size >= MAX_CACHED_SERVERS) {
+    const oldestKey = messagesCache.keys().next().value;
+    if (oldestKey) messagesCache.delete(oldestKey);
+  }
+  messagesCache.delete(key); // refresh insertion order (LRU)
+  messagesCache.set(key, rows);
+}
+
+function getMessagesCache(serverId) {
+  const key = String(serverId);
+  const val = messagesCache.get(key);
+  if (!val) return null;
+  messagesCache.delete(key); // refresh insertion order (LRU)
+  messagesCache.set(key, val);
+  return val;
+}
 
 function orderedNodeIds(preferredNode) {
   const unique = [];
@@ -281,13 +299,13 @@ app.get("/api/servers/:id/messages", async (req, res) => {
       [serverId],
       { preferredNode }
     );
-    const boundedRows = rows.slice(-MAX_CACHED_MESSAGES_PER_SERVER);
-    messagesCache.set(String(serverId), boundedRows);
-    res.json(boundedRows);
+    setMessagesCache(serverId, rows);
+    res.json(rows);
   } catch (err) {
     console.error(err);
-    if (messagesCache.has(String(serverId))) {
-      return res.json(messagesCache.get(String(serverId)));
+    const cachedRows = getMessagesCache(serverId);
+    if (cachedRows) {
+      return res.json(cachedRows);
     }
     res.status(500).json({ error: err.message });
   }
@@ -306,9 +324,8 @@ app.post("/api/messages", async (req, res) => {
       [server_id, username || "User", content],
       { preferredNode: Number(preferred_node_id) }
     );
-    const cacheKey = String(server_id);
-    const prior = messagesCache.get(cacheKey) || [];
-    messagesCache.set(cacheKey, [...prior, rows[0]].slice(-MAX_CACHED_MESSAGES_PER_SERVER));
+    const prior = getMessagesCache(server_id) || [];
+    setMessagesCache(server_id, [...prior, rows[0]]);
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error(err);
