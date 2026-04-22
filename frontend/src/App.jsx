@@ -56,9 +56,10 @@ export default function App() {
     } catch (err) { console.error("fetchServers:", err); }
   }, []);
 
-  const fetchMessages = useCallback(async (serverId) => {
+  const fetchMessages = useCallback(async (serverId, preferredNodeId) => {
     try {
-      const res = await fetch(`${API}/servers/${serverId}/messages`);
+      const qs = preferredNodeId ? `?preferredNode=${preferredNodeId}` : "";
+      const res = await fetch(`${API}/servers/${serverId}/messages${qs}`);
       if (!res.ok) throw new Error(await res.text());
       setMessages(await res.json());
     } catch (err) { console.error("fetchMessages:", err); }
@@ -88,8 +89,8 @@ export default function App() {
   useEffect(() => {
     clearInterval(pollRef.current);
     if (!selectedServer) { setMessages([]); return; }
-    fetchMessages(selectedServer.id);
-    pollRef.current = setInterval(() => fetchMessages(selectedServer.id), 2000);
+    fetchMessages(selectedServer.id, selectedServer.node_id);
+    pollRef.current = setInterval(() => fetchMessages(selectedServer.id, selectedServer.node_id), 2000);
     return () => clearInterval(pollRef.current);
   }, [selectedServer, fetchMessages]);
 
@@ -132,7 +133,12 @@ export default function App() {
       const res = await fetch(`${API}/messages`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ server_id: selectedServer.id, username, content: content.trim() }),
+        body:    JSON.stringify({
+          server_id: selectedServer.id,
+          preferred_node_id: selectedServer.node_id,
+          username,
+          content: content.trim(),
+        }),
       });
       if (!res.ok) throw new Error(await res.text());
       const msg = await res.json();
