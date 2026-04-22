@@ -34,6 +34,8 @@ const nodeBackoffUntil = { 1: 0, 2: 0, 3: 0 };
 let lastHealthyNode = 1;
 let serversCache = [];
 const messagesCache = new Map();
+const NODE_BACKOFF_MS = 5000;
+// Keep fallback payloads bounded while still preserving recent chat context during outages.
 const MAX_CACHED_MESSAGES_PER_SERVER = 500;
 
 function orderedNodeIds(preferredNode) {
@@ -62,7 +64,7 @@ async function queryDB(text, params, options = {}) {
       return result;
     }
     catch (e) {
-      nodeBackoffUntil[nodeId] = Date.now() + 5000;
+      nodeBackoffUntil[nodeId] = Date.now() + NODE_BACKOFF_MS;
       errs.push(`[roach${nodeId}] ${e.message}`);
     }
   }
@@ -79,7 +81,7 @@ async function queryAdmin(text, params, options = {}) {
       lastHealthyNode = nodeId;
       return result;
     } catch (e) {
-      nodeBackoffUntil[nodeId] = Date.now() + 5000;
+      nodeBackoffUntil[nodeId] = Date.now() + NODE_BACKOFF_MS;
       errs.push(`[roach${nodeId}] ${e.message}`);
     }
   }
@@ -279,8 +281,9 @@ app.get("/api/servers/:id/messages", async (req, res) => {
       [serverId],
       { preferredNode }
     );
-    messagesCache.set(String(serverId), rows.slice(-MAX_CACHED_MESSAGES_PER_SERVER));
-    res.json(rows);
+    const boundedRows = rows.slice(-MAX_CACHED_MESSAGES_PER_SERVER);
+    messagesCache.set(String(serverId), boundedRows);
+    res.json(boundedRows);
   } catch (err) {
     console.error(err);
     if (messagesCache.has(String(serverId))) {
