@@ -103,6 +103,45 @@ docker compose up --build
    - The shard label appears on that node.
 4. The new server is immediately selected; you can send messages to it.
 
+### Full script thuyết trình: Demo Kill Node (RF=3, quorum 2/3)
+
+> Gợi ý: đọc gần như nguyên văn khi demo trực tiếp.
+
+1. **Mở đầu bối cảnh**
+   - "Hiện tại mình có cluster CockroachDB gồm **3 node**: Node 1, Node 2, Node 3."
+   - "Trong demo này, mỗi range chạy với **RF=3** (Replication Factor = 3), nghĩa là dữ liệu của một range có **3 bản sao**, mỗi node giữ 1 replica."
+
+2. **Giải thích quorum ngắn gọn**
+   - "Với Raft, để ghi dữ liệu thành công thì cần đa số phiếu, gọi là **quorum**."
+   - "Khi RF=3 thì quorum = **2/3**. Tức là phải có ít nhất 2 replica còn sống để thống nhất log và commit write."
+
+3. **Vì sao cả cluster cần 2/3 node để hoạt động ổn định**
+   - "Ở mức cluster, khi còn **ít nhất 2/3 node** đang live, hệ thống vẫn bầu leader/leaseholder cho các range và tiếp tục ghi bình thường."
+   - "Nếu chỉ còn 1 node, cluster **mất quorum tổng thể**: đa số range không thể commit write nữa, chỉ còn khả năng đọc hạn chế (thường là stale/local read)."
+
+4. **Vì sao một range cũng cần 2/3 replica để hoạt động ghi**
+   - "Ở mức từng range, điều kiện tương tự: RF=3 thì range đó cần **2 replica sống** để có quorum."
+   - "Nếu range chỉ còn 1 replica sống thì range đó không thể ghi vì không đủ đa số để xác nhận commit."
+
+5. **Thao tác demo kill 1 node**
+   - "Bây giờ mình bấm **Kill Node 3**."
+   - "Lúc này còn Node 1 và Node 2, tức vẫn **2/3** => cluster còn quorum."
+   - "UI sẽ hiện log heartbeat timeout, election/lease transfer, sau đó báo cluster vẫn operational."
+   - "Mình gửi message lại để chứng minh write vẫn thành công."
+
+6. **Thao tác demo kill thêm 1 node (mất quorum)**
+   - "Tiếp theo mình kill thêm Node 2."
+   - "Bây giờ chỉ còn Node 1, tức **1/3** => không còn quorum."
+   - "UI sẽ báo **QUORUM LOST**; write bị block vì cả cluster và hầu hết range đều không đạt điều kiện 2/3."
+
+7. **Khôi phục node**
+   - "Mình bấm **Restart Node 2** (hoặc Node 3)."
+   - "Khi cluster quay lại tối thiểu 2 node live, quorum được khôi phục, lease được cân bằng lại và write hoạt động trở lại."
+
+8. **Chốt thông điệp**
+   - "**Kết luận:** với RF=3, cả ở cấp cluster lẫn cấp range, ngưỡng sống còn để ghi ổn định là **2/3**."
+   - "Đó là lý do kiến trúc distributed luôn ưu tiên số node lẻ và cơ chế majority quorum."
+
 ---
 
 ## Development (without Docker)
