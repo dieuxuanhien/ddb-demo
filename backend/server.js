@@ -72,6 +72,11 @@ function orderedNodeIds(preferredNode) {
   return healthy.length > 0 ? [...healthy, ...unique.filter((id) => nodeBackoffUntil[id] > now)] : unique;
 }
 
+function parsePreferredNode(value) {
+  const n = Number(value);
+  return NODE_IDS.includes(n) ? n : undefined;
+}
+
 async function queryDB(text, params, options = {}) {
   const errs = [];
   for (const nodeId of orderedNodeIds(options.preferredNode)) {
@@ -291,7 +296,7 @@ app.post("/api/servers", async (req, res) => {
 
 app.get("/api/servers/:id/messages", async (req, res) => {
   const serverId = req.params.id;
-  const preferredNode = Number(req.query.preferredNode);
+  const preferredNode = parsePreferredNode(req.query.preferredNode);
   if (!/^\d+$/.test(serverId)) return res.status(400).json({ error: "invalid server id" });
   try {
     const { rows } = await queryDB(
@@ -316,6 +321,7 @@ app.get("/api/servers/:id/messages", async (req, res) => {
 
 app.post("/api/messages", async (req, res) => {
   const { server_id, username, content, preferred_node_id } = req.body;
+  const preferredNode = parsePreferredNode(preferred_node_id);
   if (!server_id || !content) return res.status(400).json({ error: "server_id and content are required" });
   try {
     const { rows } = await queryDB(
@@ -323,7 +329,7 @@ app.post("/api/messages", async (req, res) => {
        VALUES ($1, $2, $3)
        RETURNING id, server_id, username, content, timestamp`,
       [server_id, username || "User", content],
-      { preferredNode: Number(preferred_node_id) }
+      { preferredNode }
     );
     const prior = getMessagesCache(server_id) || [];
     setMessagesCache(server_id, [...prior, rows[0]]);
