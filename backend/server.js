@@ -34,6 +34,7 @@ const nodeBackoffUntil = { 1: 0, 2: 0, 3: 0 };
 let lastHealthyNode = 1;
 let serversCache = [];
 const messagesCache = new Map();
+const MAX_CACHED_MESSAGES_PER_SERVER = 500;
 
 function orderedNodeIds(preferredNode) {
   const unique = [];
@@ -256,7 +257,7 @@ app.post("/api/servers", async (req, res) => {
       "INSERT INTO servers (name, node_id) VALUES ($1, $2) RETURNING id, name, node_id",
       [name.trim(), targetNode]
     );
-    serversCache = [...serversCache.filter((s) => String(s.id) !== String(rows[0].id)), rows[0]];
+    serversCache = [...serversCache, rows[0]];
     res.status(201).json(rows[0]);
   } catch (err) {
     if (err.code === "23505") return res.status(409).json({ error: "Server name already exists" });
@@ -278,7 +279,7 @@ app.get("/api/servers/:id/messages", async (req, res) => {
       [serverId],
       { preferredNode }
     );
-    messagesCache.set(String(serverId), rows);
+    messagesCache.set(String(serverId), rows.slice(-MAX_CACHED_MESSAGES_PER_SERVER));
     res.json(rows);
   } catch (err) {
     console.error(err);
@@ -304,7 +305,7 @@ app.post("/api/messages", async (req, res) => {
     );
     const cacheKey = String(server_id);
     const prior = messagesCache.get(cacheKey) || [];
-    messagesCache.set(cacheKey, [...prior, rows[0]]);
+    messagesCache.set(cacheKey, [...prior, rows[0]].slice(-MAX_CACHED_MESSAGES_PER_SERVER));
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error(err);
