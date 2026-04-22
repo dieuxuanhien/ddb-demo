@@ -309,9 +309,11 @@ export default function ClusterPane({
           ? placement.replicas
           : null;
     const replicaNodes = replicaNodesFromDB ?? [];
-    const leaseholderNode = Number.isInteger(placement?.leaseholderNode)
-      ? placement.leaseholderNode
-      : replicaNodes[0] ?? null;
+    const leaseholderNode = Number.isInteger(placement?.effectiveLeaseholderNode)
+      ? placement.effectiveLeaseholderNode
+      : Number.isInteger(placement?.leaseholderNode)
+        ? placement.leaseholderNode
+        : replicaNodes[0] ?? null;
     replicaCounts.push(replicaNodes.length);
 
     for (const nodeId of replicaNodes) {

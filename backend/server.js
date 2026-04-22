@@ -32,6 +32,18 @@ const ADMIN_DB_URLS = DB_URLS.map((u) => {
 });
 const adminPools = ADMIN_DB_URLS.map((u) => new Pool({ connectionString: u, connectionTimeoutMillis: 3000 }));
 
+for (const [idx, pool] of pools.entries()) {
+  pool.on("error", (err) => {
+    console.warn(`DB pool[${idx + 1}] idle client error: ${err.message}`);
+  });
+}
+
+for (const [idx, pool] of adminPools.entries()) {
+  pool.on("error", (err) => {
+    console.warn(`Admin DB pool[${idx + 1}] idle client error: ${err.message}`);
+  });
+}
+
 async function queryDB(text, params) {
   const errs = [];
   for (const pool of pools) {
@@ -89,15 +101,77 @@ async function getRangePlacementForServer(serverId) {
   };
 }
 
+function withEffectiveLeaseholder(placement, liveNodeSet) {
+  if (!placement) return null;
+
+  const replicaCandidates = Array.isArray(placement.effectiveReplicas) && placement.effectiveReplicas.length > 0
+    ? placement.effectiveReplicas
+    : Array.isArray(placement.votingReplicas) && placement.votingReplicas.length > 0
+      ? placement.votingReplicas
+      : Array.isArray(placement.replicas)
+        ? placement.replicas
+        : [];
+
+  const leaseholderNode = Number.isInteger(placement.leaseholderNode) ? placement.leaseholderNode : null;
+  const isLeaseholderLive = leaseholderNode != null && liveNodeSet.has(leaseholderNode);
+  const fallbackLiveReplica = replicaCandidates.find((n) => liveNodeSet.has(n)) ?? null;
+
+  return {
+    ...placement,
+    effectiveLeaseholderNode: isLeaseholderLive ? leaseholderNode : fallbackLiveReplica,
+  };
+}
+
 function isIgnorableSplitError(err) {
   const msg = String(err?.message || "").toLowerCase();
   return msg.includes("existing range boundary") || msg.includes("already split") || msg.includes("duplicate");
+}
+
+// Rotate tie-break choices so equally loaded nodes are selected fairly over time.
+let leaseholderTieBreaker = 1;
+
+function chooseLeastLoadedNode(leaseholderCount) {
+  const nodes = Object.keys(leaseholderCount).map(Number).sort((a, b) => a - b);
+  const minCount = Math.min(...nodes.map((n) => leaseholderCount[n] ?? Number.MAX_SAFE_INTEGER));
+  const candidates = nodes.filter((n) => leaseholderCount[n] === minCount);
+  if (!candidates.length) return 1;
+
+  const startIdx = Math.max(0, candidates.findIndex((n) => n >= leaseholderTieBreaker));
+  const chosen = candidates[startIdx] ?? candidates[0];
+  leaseholderTieBreaker = chosen === nodes[nodes.length - 1] ? nodes[0] : chosen + 1;
+  return chosen;
 }
 
 async function splitRangeForServer(serverId) {
   if (!validateServerId(serverId)) return false;
   try {
     await queryDB(`ALTER TABLE messages SPLIT AT VALUES (${serverId}, 0)`);
+
+    // Choose leaseholder node with the least current leaseholders for even distribution
+    const allServers = await queryDB("SELECT id FROM servers ORDER BY id");
+    const serverIds = allServers.rows.map(r => String(r.id));
+    const placements = {};
+    for (const id of serverIds) {
+      const p = await getRangePlacementForServer(id);
+      if (p) placements[id] = p;
+    }
+
+    // Count leaseholders per node
+    const leaseholderCount = { 1: 0, 2: 0, 3: 0, 4: 0 };
+    for (const p of Object.values(placements)) {
+      if (p.leaseholderNode && leaseholderCount[p.leaseholderNode] !== undefined) {
+        leaseholderCount[p.leaseholderNode]++;
+      }
+    }
+
+    // Choose the least-loaded node; when tied, rotate choices for smoother balancing.
+    const targetNode = chooseLeastLoadedNode(leaseholderCount);
+
+    const placement = await getRangePlacementForServer(serverId);
+    if (placement && placement.rangeId) {
+      await queryDB(`ALTER RANGE ${placement.rangeId} RELOCATE LEASE TO ${targetNode}`);
+    }
+
     return true;
   } catch (err) {
     if (isIgnorableSplitError(err)) return false;
@@ -105,18 +179,12 @@ async function splitRangeForServer(serverId) {
   }
 }
 
-async function scatterMessageRanges() {
-  // SCATTER randomizes leaseholders/replica placement across nodes for demo visibility.
-  await queryDB("ALTER TABLE messages SCATTER");
-}
-
 async function ensureServerRangeSplits() {
   const { rows } = await queryDB("SELECT id FROM servers ORDER BY id");
   for (const row of rows) {
     await splitRangeForServer(String(row.id));
   }
-  await scatterMessageRanges();
-  console.log("✓ Server range splits ensured for demo");
+  console.log("✓ Server range splits ensured by server_id");
 }
 
 async function waitForDB(maxAttempts = 30, delayMs = 3000) {
@@ -139,7 +207,7 @@ async function ensureSchema() {
 
   await queryDB(`
     CREATE TABLE IF NOT EXISTS servers (
-      id INT DEFAULT unique_rowid() PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
       name TEXT NOT NULL
     )
   `);
@@ -171,13 +239,20 @@ async function ensureSchema() {
 
   await ensureDemoTuning();
 
-  await queryDB(`
-    INSERT INTO servers (name)
-    VALUES ('General'), ('Random')
-    ON CONFLICT (name) DO NOTHING
-  `);
+  // await queryDB(`
+  //   INSERT INTO servers (name)
+  //   VALUES ('General'), ('Random')
+  //   ON CONFLICT (name) DO NOTHING
+  // `);
 
-  await ensureServerRangeSplits();
+  // Do not block API startup on backfilling splits for many legacy servers.
+  setImmediate(async () => {
+    try {
+      await ensureServerRangeSplits();
+    } catch (err) {
+      console.warn(`Background ensureServerRangeSplits failed: ${err.message}`);
+    }
+  });
 
   console.log("✓ Database schema verified");
 }
@@ -242,7 +317,168 @@ async function findContainer(service) {
   return Array.isArray(body) && body.length > 0 ? body[0] : null;
 }
 
-async function initCluster(maxAttempts = 30, delayMs = 2000) {
+async function getNodeStatuses() {
+  const status = {};
+  for (const id of [1, 2, 3, 4]) {
+    try {
+      const c = await findContainer(`roach${id}`);
+      status[id] = !c ? "unknown" : c.State === "running" ? "live" : "dead";
+    } catch {
+      status[id] = "unknown";
+    }
+  }
+  return status;
+}
+
+async function getLiveNodeIds() {
+  const statuses = await getNodeStatuses();
+  return [1, 2, 3, 4].filter((id) => statuses[id] === "live");
+}
+
+async function rebalanceLeasesFromDeadNode(deadNodeId) {
+  const liveNodeSet = new Set(await getLiveNodeIds());
+  const { rows } = await queryDB("SELECT id FROM servers ORDER BY id");
+
+  let checked = 0;
+  let moved = 0;
+  for (const row of rows) {
+    const serverId = String(row.id);
+    let placement;
+    try {
+      placement = await getRangePlacementForServer(serverId);
+    } catch {
+      continue;
+    }
+    if (!placement) continue;
+    checked += 1;
+
+    if (placement.leaseholderNode !== deadNodeId || !placement.rangeId) continue;
+
+    const candidateReplicas = (placement.votingReplicas.length ? placement.votingReplicas : placement.replicas)
+      .filter((nodeId) => nodeId !== deadNodeId && liveNodeSet.has(nodeId));
+    const targetNode = candidateReplicas[0] ?? null;
+    if (!targetNode) continue;
+
+    try {
+      await queryDB(`ALTER RANGE ${placement.rangeId} RELOCATE LEASE TO ${targetNode}`);
+      moved += 1;
+    } catch {
+      // Best-effort rebalance: CockroachDB may already have transferred lease.
+    }
+  }
+
+  return { checked, moved };
+}
+
+// Comprehensive rebalance: distribute all leaseholders evenly across live nodes
+async function rebalanceAllLeaseholders() {
+  try {
+    const liveNodeSet = new Set(await getLiveNodeIds());
+    if (liveNodeSet.size === 0) return { checked: 0, moved: 0, error: "no live nodes" };
+
+    const { rows } = await queryDB("SELECT id FROM servers ORDER BY id");
+
+    // Count current leaseholders ONCE (front-load this expensive operation)
+    const leaseholderCount = { 1: 0, 2: 0, 3: 0, 4: 0 };
+    const placements = {};
+
+    for (const row of rows) {
+      const serverId = String(row.id);
+      try {
+        const p = await getRangePlacementForServer(serverId);
+        if (p) {
+          placements[serverId] = p;
+          if (p.leaseholderNode && liveNodeSet.has(p.leaseholderNode)) {
+            leaseholderCount[p.leaseholderNode]++;
+          }
+        }
+      } catch {
+        // skip unreachable ranges
+      }
+    }
+
+    const totalRanges = Object.keys(placements).length;
+    const targetPerNode = Math.floor(totalRanges / liveNodeSet.size);
+    const remainder = totalRanges % liveNodeSet.size;
+
+    // Calculate target counts: some nodes get targetPerNode + 1, others get targetPerNode
+    const liveNodes = Array.from(liveNodeSet).sort((a, b) => a - b);
+    const targetCounts = {};
+    for (let i = 0; i < liveNodes.length; i++) {
+      targetCounts[liveNodes[i]] = targetPerNode + (i < remainder ? 1 : 0);
+    }
+
+    let checked = 0;
+    let moved = 0;
+
+    // First pass: handle dead leaseholders (immediate relocation)
+    for (const [serverId, placement] of Object.entries(placements)) {
+      if (!placement.rangeId) continue;
+      checked += 1;
+
+      const currentLeaseholder = placement.leaseholderNode;
+
+      // If current leaseholder is dead, immediately relocate to any live replica
+      if (currentLeaseholder && !liveNodeSet.has(currentLeaseholder)) {
+        const candidateReplicas = (placement.votingReplicas.length ? placement.votingReplicas : placement.replicas)
+          .filter((nodeId) => liveNodeSet.has(nodeId));
+        const targetNode = candidateReplicas[0] ?? null;
+        if (!targetNode) continue;
+        try {
+          await queryDB(`ALTER RANGE ${placement.rangeId} RELOCATE LEASE TO ${targetNode}`);
+          leaseholderCount[targetNode]++;
+          moved += 1;
+        } catch {
+          // Best-effort
+        }
+        continue;
+      }
+    }
+
+    // Second pass: balance live leaseholders to achieve equal distribution
+    const overLoaded = [];
+    const underLoaded = [];
+
+    for (const nodeId of liveNodes) {
+      const current = leaseholderCount[nodeId] || 0;
+      const target = targetCounts[nodeId];
+      if (current > target) {
+        overLoaded.push({ nodeId, excess: current - target });
+      } else if (current < target) {
+        underLoaded.push({ nodeId, deficit: target - current });
+      }
+    }
+
+    // Only move ONE range per cycle to avoid overwhelming the system
+    if (overLoaded.length > 0 && underLoaded.length > 0) {
+      const over = overLoaded[0]; // Take first over-loaded node
+      const under = underLoaded[0]; // Take first under-loaded node
+
+      // Find one range on the over-loaded node that can be moved to under-loaded node
+      for (const [serverId, placement] of Object.entries(placements)) {
+        if (placement.leaseholderNode === over.nodeId &&
+            (placement.votingReplicas.includes(under.nodeId) || placement.replicas.includes(under.nodeId))) {
+          try {
+            await queryDB(`ALTER RANGE ${placement.rangeId} RELOCATE LEASE TO ${under.nodeId}`);
+            moved += 1;
+          } catch {
+            // Best-effort
+          }
+          break; // Only move one range per cycle
+        }
+      }
+    } else if (overLoaded.length === 0 && underLoaded.length === 0) {
+      // Perfectly balanced - no action needed
+      return { checked, moved: 0 };
+    }
+
+    return { checked, moved };
+  } catch (err) {
+    return { checked: 0, moved: 0, error: err.message };
+  }
+}
+
+async function initCluster(maxAttempts = 5, delayMs = 1000) {
   for (let i = 1; i <= maxAttempts; i++) {
     try {
       const c = await findContainer("roach1");
@@ -285,7 +521,9 @@ async function initCluster(maxAttempts = 30, delayMs = 2000) {
     }
   }
 
-  throw new Error("Could not initialize CockroachDB cluster.");
+  // Do not fail the API startup if explicit init cannot be executed.
+  // In demo mode, the cluster may already be initialized or roach1 may be temporarily unavailable.
+  console.warn("⚠ Could not run explicit cockroach init; continuing boot and relying on existing cluster state");
 }
 
 // ── Express app ────────────────────────────────────────────────────────────
@@ -320,10 +558,9 @@ app.post("/api/servers", async (req, res) => {
     );
     const server = rows[0];
 
-    // Demo behavior: split by server_id immediately, then scatter ranges
-    // so newly created servers are more likely to map to different nodes.
+    // Split exactly at (server_id, 0) so each server gets its own key range.
+    // Messages are keyed by (server_id, id), so writes follow that server range.
     const splitCreated = await splitRangeForServer(String(server.id));
-    await scatterMessageRanges();
     const placement = await getRangePlacementForServer(String(server.id));
 
     res.status(201).json({
@@ -407,11 +644,12 @@ app.get("/api/placements", async (req, res) => {
       serverIds = rows.map((r) => String(r.id));
     }
 
+    const liveNodeSet = new Set(await getLiveNodeIds());
     const placements = {};
     for (const id of serverIds) {
       if (!validateServerId(id)) continue;
       const placement = await getRangePlacementForServer(id);
-      if (placement) placements[id] = placement;
+      if (placement) placements[id] = withEffectiveLeaseholder(placement, liveNodeSet);
     }
 
     res.json({
@@ -428,15 +666,7 @@ app.get("/api/placements", async (req, res) => {
 
 /** GET /api/nodes/status → { 1: "live"|"dead"|"unknown", 2: …, 3: …, 4: … } */
 app.get("/api/nodes/status", async (_req, res) => {
-  const status = {};
-  for (const id of [1, 2, 3, 4]) {
-    try {
-      const c = await findContainer(`roach${id}`);
-      status[id] = !c ? "unknown" : c.State === "running" ? "live" : "dead";
-    } catch {
-      status[id] = "unknown";
-    }
-  }
+  const status = await getNodeStatuses();
   res.json(status);
 });
 
@@ -445,12 +675,36 @@ app.post("/api/nodes/:id/kill", async (req, res) => {
   const id = Number(req.params.id);
   if (![1, 2, 3, 4].includes(id)) return res.status(400).json({ error: "invalid node id" });
   try {
+    const force = String(req.query.force || "").toLowerCase() === "1" || String(req.query.force || "").toLowerCase() === "true";
+    const liveBefore = await getLiveNodeIds();
+    // if (!force && liveBefore.length <= 3) {
+    //   return res.status(409).json({
+    //     error: `Refusing to kill Node ${id}: only ${liveBefore.length} live node(s). This can lose quorum and make writes unavailable.`,
+    //     liveNodes: liveBefore,
+    //   });
+    // }
+
     const c = await findContainer(`roach${id}`);
     if (!c) return res.status(404).json({ error: `roach${id} not found` });
+    if (c.State !== "running") {
+      return res.json({ node: id, status: "already-stopped", liveNodes: liveBefore });
+    }
+
     const result = await dockerRequest("POST", `/containers/${c.Id}/stop?t=2`);
-    if (result.status >= 200 && result.status < 300) {
+    if ((result.status >= 200 && result.status < 300) || result.status === 304) {
       console.log(`⚡ Node ${id} stopped`);
-      res.json({ node: id, status: "stopped" });
+      const liveAfter = await getLiveNodeIds();
+      res.json({ node: id, status: "stopped", liveNodes: liveAfter, rebalance: "scheduled" });
+
+      // Run comprehensive lease rebalance in background to avoid blocking this API call.
+      setImmediate(async () => {
+        try {
+          const summary = await rebalanceAllLeaseholders();
+          console.log(`ℹ Lease rebalance after Node ${id} stop: checked=${summary.checked}, moved=${summary.moved}`);
+        } catch (rebalanceErr) {
+          console.warn(`Lease rebalance after Node ${id} stop failed: ${rebalanceErr.message}`);
+        }
+      });
     } else {
       throw new Error(`Docker API error: ${result.status} ${result.body}`);
     }
@@ -467,10 +721,26 @@ app.post("/api/nodes/:id/start", async (req, res) => {
   try {
     const c = await findContainer(`roach${id}`);
     if (!c) return res.status(404).json({ error: `roach${id} not found` });
+    if (c.State === "running") {
+      const liveNodes = await getLiveNodeIds();
+      return res.json({ node: id, status: "already-started", liveNodes });
+    }
+
     const result = await dockerRequest("POST", `/containers/${c.Id}/start`);
-    if (result.status >= 200 && result.status < 300) {
+    if ((result.status >= 200 && result.status < 300) || result.status === 304) {
       console.log(`✅ Node ${id} started`);
-      res.json({ node: id, status: "started" });
+      const liveNodes = await getLiveNodeIds();
+      res.json({ node: id, status: "started", liveNodes, rebalance: "scheduled" });
+
+      // Run comprehensive lease rebalance in background
+      setImmediate(async () => {
+        try {
+          const summary = await rebalanceAllLeaseholders();
+          console.log(`ℹ Lease rebalance after Node ${id} start: checked=${summary.checked}, moved=${summary.moved}`);
+        } catch (rebalanceErr) {
+          console.warn(`Lease rebalance after Node ${id} start failed: ${rebalanceErr.message}`);
+        }
+      });
     } else {
       throw new Error(`Docker API error: ${result.status} ${result.body}`);
     }
@@ -479,6 +749,19 @@ app.post("/api/nodes/:id/start", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── Continuous rebalance every 4 seconds ───────────────────────────────────
+
+setInterval(async () => {
+  try {
+    const summary = await rebalanceAllLeaseholders();
+    if (summary.moved > 0) {
+      console.log(`ℹ Background rebalance: checked=${summary.checked}, moved=${summary.moved}`);
+    }
+  } catch (err) {
+    console.warn(`Background rebalance failed: ${err.message}`);
+  }
+}, 4000);
 
 // ── Boot ────────────────────────────────────────────────────────────────────
 

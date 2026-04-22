@@ -4,6 +4,7 @@ export default function DiscordPane({
   servers,
   selectedServer,
   messages,
+  messagesLoading = false,
   username,
   placementByServer = {},
   onSelectServer,
@@ -53,6 +54,7 @@ export default function DiscordPane({
 
   function leaseholderNodeFromPlacement(serverId) {
     const placement = placementByServer[String(serverId)] ?? placementByServer[serverId] ?? null;
+    if (Number.isInteger(placement?.effectiveLeaseholderNode)) return placement.effectiveLeaseholderNode;
     if (Number.isInteger(placement?.leaseholderNode)) return placement.leaseholderNode;
     return null;
   }
@@ -94,7 +96,7 @@ export default function DiscordPane({
               />
               <span className="truncate">{srv.name}</span>
               <span className="ml-auto text-[9px] text-discord-muted opacity-60">
-                {leaseholderLabel} · RF3
+                {leaseholderLabel} · RF4
               </span>
             </button>
               );
@@ -143,7 +145,7 @@ export default function DiscordPane({
                 border ${nodeBorder[leaseholderNode] ?? "border-gray-500/40"}
                 text-discord-muted`}
             >
-              Leaseholder {leaseholderLabel} · RF3
+              Leaseholder {leaseholderLabel} · RF4
             </span>
               );
             })()
@@ -160,7 +162,7 @@ export default function DiscordPane({
 
           {selectedServer && messages.length === 0 && (
             <p className="text-discord-muted text-sm text-center mt-12">
-              No messages yet. Say something!
+              {messagesLoading ? "Loading messages…" : "No messages yet. Say something!"}
             </p>
           )}
 

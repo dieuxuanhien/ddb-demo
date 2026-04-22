@@ -5,10 +5,34 @@ import ClusterPane from "./components/ClusterPane.jsx";
 const API = "/api";
 let packetIdCounter = 0;
 
+function extractApiErrorMessage(status, bodyText) {
+  const text = String(bodyText || "").trim();
+  try {
+    const parsed = JSON.parse(text);
+    return parsed.error || parsed.message || `Request failed (${status})`;
+  } catch {
+    // Not JSON; likely proxy HTML or plain text.
+  }
+
+  const lower = text.toLowerCase();
+  if (status === 502 || lower.includes("bad gateway")) {
+    return "Gateway 502: backend tạm thời không phản hồi. Vui lòng thử lại sau 1-2 giây.";
+  }
+  if (status === 504 || lower.includes("gateway timeout")) {
+    return "Gateway timeout: backend xử lý quá lâu, vui lòng thử lại.";
+  }
+  if (text.startsWith("<")) {
+    return `Request failed (${status}). Upstream API unavailable.`;
+  }
+  return text || `Request failed (${status})`;
+}
+
 export default function App() {
   const [servers, setServers]               = useState([]);
   const [selectedServer, setSelectedServer] = useState(null);
   const [messages, setMessages]             = useState([]);
+  const [messagesByServer, setMessagesByServer] = useState({});
+  const [messagesLoading, setMessagesLoading] = useState(false);
   const [packets, setPackets]               = useState([]);
   const [evaluating, setEvaluating]         = useState(false);
   const [nodeHighlight, setNodeHighlight]   = useState(null);
@@ -19,7 +43,11 @@ export default function App() {
 
   const pollRef         = useRef(null);
   const nodeStatusesRef = useRef(nodeStatuses); // always-fresh ref for callbacks
+  const selectedServerRef = useRef(selectedServer);
+  const messagesByServerRef = useRef(messagesByServer);
   useEffect(() => { nodeStatusesRef.current = nodeStatuses; }, [nodeStatuses]);
+  useEffect(() => { selectedServerRef.current = selectedServer; }, [selectedServer]);
+  useEffect(() => { messagesByServerRef.current = messagesByServer; }, [messagesByServer]);
 
   // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -65,6 +93,7 @@ export default function App() {
 
   const getLeaseholderNode = useCallback((serverId) => {
     const placement = getPlacement(serverId);
+    if (Number.isInteger(placement?.effectiveLeaseholderNode)) return placement.effectiveLeaseholderNode;
     if (Number.isInteger(placement?.leaseholderNode)) return placement.leaseholderNode;
     const replicas = getReplicaNodes(serverId);
     return replicas[0] ?? null;
@@ -86,12 +115,22 @@ export default function App() {
     } catch (err) { console.error("fetchServers:", err); }
   }, []);
 
-  const fetchMessages = useCallback(async (serverId) => {
+  const fetchMessages = useCallback(async (serverId, { showLoading = true } = {}) => {
+    const key = String(serverId);
+    const requestSelectedId = String(selectedServerRef.current?.id ?? "");
+    if (showLoading) setMessagesLoading(true);
     try {
       const res = await fetch(`${API}/servers/${serverId}/messages`);
       if (!res.ok) throw new Error(await res.text());
-      setMessages(await res.json());
+      const data = await res.json();
+      setMessagesByServer((prev) => ({ ...prev, [key]: data }));
+      if (requestSelectedId === key) setMessages(data);
     } catch (err) { console.error("fetchMessages:", err); }
+    finally {
+      if (String(selectedServerRef.current?.id ?? "") === key) {
+        setMessagesLoading(false);
+      }
+    }
   }, []);
 
   const fetchPlacements = useCallback(async (serverIds) => {
@@ -136,9 +175,23 @@ export default function App() {
 
   useEffect(() => {
     clearInterval(pollRef.current);
-    if (!selectedServer) { setMessages([]); return; }
-    fetchMessages(selectedServer.id);
-    pollRef.current = setInterval(() => fetchMessages(selectedServer.id), 3000);
+    if (!selectedServer) {
+      setMessages([]);
+      setMessagesLoading(false);
+      return;
+    }
+    const cacheKey = String(selectedServer.id);
+    const hasCache = Object.prototype.hasOwnProperty.call(messagesByServerRef.current, cacheKey);
+    const cached = hasCache ? messagesByServerRef.current[cacheKey] : null;
+    if (hasCache) {
+      setMessages(cached);
+      setMessagesLoading(false);
+    } else {
+      setMessages([]);
+      setMessagesLoading(true);
+    }
+    fetchMessages(selectedServer.id, { showLoading: !cached });
+    pollRef.current = setInterval(() => fetchMessages(selectedServer.id, { showLoading: false }), 3000);
     return () => clearInterval(pollRef.current);
   }, [selectedServer, fetchMessages]);
 
@@ -164,7 +217,11 @@ export default function App() {
 
   const handleSelectServer = useCallback((server) => {
     setSelectedServer(server);
-    setMessages([]);
+    const cacheKey = String(server.id);
+    const hasCache = Object.prototype.hasOwnProperty.call(messagesByServerRef.current, cacheKey);
+    const cached = hasCache ? messagesByServerRef.current[cacheKey] : [];
+    setMessages(cached);
+    setMessagesLoading(!hasCache);
   }, []);
 
   const handleSendMessage = useCallback(async (content) => {
@@ -177,7 +234,11 @@ export default function App() {
       const placement = freshPlacements[String(selectedServer.id)] ?? null;
       const effective = placement?.effectiveReplicas ?? placement?.votingReplicas ?? placement?.replicas ?? [];
       replicaNodes = Array.isArray(effective) ? effective : [];
-      leaseholderNode = Number.isInteger(placement?.leaseholderNode) ? placement.leaseholderNode : (replicaNodes[0] ?? null);
+      leaseholderNode = Number.isInteger(placement?.effectiveLeaseholderNode)
+        ? placement.effectiveLeaseholderNode
+        : Number.isInteger(placement?.leaseholderNode)
+          ? placement.leaseholderNode
+          : (replicaNodes[0] ?? null);
     }
 
     const statuses    = nodeStatusesRef.current;
@@ -264,7 +325,11 @@ export default function App() {
       const placement = responsePlacement ?? freshPlacements[String(newServer.id)] ?? null;
       const effective = placement?.effectiveReplicas ?? placement?.votingReplicas ?? placement?.replicas ?? [];
       const replicaNodes = Array.isArray(effective) ? effective : [];
-      const targetNode = Number.isInteger(placement?.leaseholderNode) ? placement.leaseholderNode : (replicaNodes[0] ?? null);
+      const targetNode = Number.isInteger(placement?.effectiveLeaseholderNode)
+        ? placement.effectiveLeaseholderNode
+        : Number.isInteger(placement?.leaseholderNode)
+          ? placement.leaseholderNode
+          : (replicaNodes[0] ?? null);
 
       if (targetNode) {
         spawnPacket(targetNode, "#23a55a");
@@ -275,7 +340,7 @@ export default function App() {
         }, 250);
         setNodeHighlight(targetNode);
         setTimeout(() => setNodeHighlight(null), 2000);
-        log(`✅ split+scatter applied: server_id=${newServer.id} now maps to range ${placement?.rangeId ?? "?"}, leaseholder Node ${targetNode}`);
+        log(`✅ split by server_id applied: server_id=${newServer.id} maps to range ${placement?.rangeId ?? "?"}, leaseholder Node ${targetNode}`);
       } else {
         log(`ℹ Server created; placement metadata still warming up from CockroachDB`);
       }
@@ -302,7 +367,16 @@ export default function App() {
 
     try {
       const res = await fetch(`${API}/nodes/${nodeId}/kill`, { method: "POST" });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) {
+        const bodyText = await res.text();
+        const msg = extractApiErrorMessage(res.status, bodyText);
+        throw new Error(msg);
+      }
+
+      await fetchNodeStatuses();
+      if (servers.length > 0) {
+        await fetchPlacements(servers.map((s) => s.id));
+      }
 
       log(`💥 Node ${nodeId}: process terminated`);
 
@@ -350,22 +424,30 @@ export default function App() {
 
     } catch (err) {
       log(`❌ Kill failed: ${err.message}`);
-      setNodeStatuses((prev) => ({ ...prev, [nodeId]: "live" })); // revert
+      await fetchNodeStatuses();
     }
-  }, [log]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [fetchNodeStatuses, fetchPlacements, log, servers]);
 
   const handleRestartNode = useCallback(async (nodeId) => {
     log(`🔄 Restarting Node ${nodeId}…`);
     setNodeStatuses((prev) => ({ ...prev, [nodeId]: "starting" }));
     try {
       const res = await fetch(`${API}/nodes/${nodeId}/start`, { method: "POST" });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) {
+        const bodyText = await res.text();
+        const msg = extractApiErrorMessage(res.status, bodyText);
+        throw new Error(msg);
+      }
+      await fetchNodeStatuses();
+      if (servers.length > 0) {
+        await fetchPlacements(servers.map((s) => s.id));
+      }
       log(`⏳ Node ${nodeId} is coming back online — CockroachDB will rebalance replicas automatically`);
     } catch (err) {
       log(`❌ Restart failed: ${err.message}`);
       setNodeStatuses((prev) => ({ ...prev, [nodeId]: "dead" }));
     }
-  }, [log]);
+  }, [fetchNodeStatuses, fetchPlacements, log, servers]);
 
   // ── render ─────────────────────────────────────────────────────────────────
 
@@ -376,6 +458,7 @@ export default function App() {
           servers={servers}
           selectedServer={selectedServer}
           messages={messages}
+          messagesLoading={messagesLoading}
           username={username}
           placementByServer={placements}
           onSelectServer={handleSelectServer}
